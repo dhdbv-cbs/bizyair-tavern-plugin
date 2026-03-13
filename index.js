@@ -479,6 +479,34 @@
         return true;
     }
 
+    function replaceTextWithNodeAt(rootElement, startIdx, length, nodeToInject) {
+        if (startIdx < 0 || length <= 0) return false;
+
+        let textMap = [];
+        function traverse(node) {
+            if (node.nodeType === Node.TEXT_NODE) {
+                for (let i = 0; i < node.nodeValue.length; i++) {
+                    textMap.push({ node: node, offset: i });
+                }
+            } else {
+                node.childNodes.forEach(traverse);
+            }
+        }
+
+        traverse(rootElement);
+        const endIdx = startIdx + length - 1;
+        const startEntry = textMap[startIdx];
+        const endEntry = textMap[endIdx];
+        if (!startEntry || !endEntry) return false;
+
+        const range = document.createRange();
+        range.setStart(startEntry.node, startEntry.offset);
+        range.setEnd(endEntry.node, endEntry.offset + 1);
+        range.deleteContents();
+        range.insertNode(nodeToInject);
+        return true;
+    }
+
     function replaceTextWithNode(rootElement, searchText, nodeToInject) {
         let textMap = [];
         let fullText = "";
@@ -645,21 +673,32 @@
                 processedTags.add(el.getAttribute('data-bizyair-tag'));
             });
 
-            const imageRegex = /&lt;image&gt;image##([^#]+)##&lt;\/image&gt;|<image>image##([^#]+)##<\/image>|image##([^#]+)##/g;
-            let match;
-            const text = messageEl.innerHTML || "";
+            const text = messageEl.textContent || "";
+            const imageRegex = /image##([^#]+)##/g;
+            const matches = [];
 
+            let match;
             while ((match = imageRegex.exec(text)) !== null) {
                 const fullMatch = match[0];
-                const description = (match[1] || match[2] || match[3] || "").trim();
+                const description = (match[1] || "").trim();
                 if (!description) continue;
 
-                const occurrenceKey = `${messageIndex}-${match.index}-${fullMatch.length}`;
-                const tagKey = `${fullMatch}@${occurrenceKey}`;
+                matches.push({
+                    fullMatch,
+                    description,
+                    index: match.index,
+                    length: fullMatch.length
+                });
+            }
+
+            for (let i = matches.length - 1; i >= 0; i--) {
+                const current = matches[i];
+                const occurrenceKey = `${messageIndex}-${current.index}-${current.length}`;
+                const tagKey = `${current.fullMatch}@${occurrenceKey}`;
 
                 if (processedTags.has(tagKey)) continue;
 
-                const slotId = getSlotIdFromTag(description, occurrenceKey);
+                const slotId = getSlotIdFromTag(current.description, occurrenceKey);
                 const existingWrapper = messageEl.querySelector(`.bizyair-inject-wrapper[data-slot-id="${slotId}"]`);
                 const savedItem = getSavedGalleryItem(slotId);
 
@@ -670,7 +709,7 @@
 
                         const currentImg = existingWrapper.querySelector('.bizyair-result-img');
                         if (!currentImg || currentImg.src !== savedItem.url) {
-                            renderImageResult(existingWrapper, slotId, description, savedItem.url);
+                            renderImageResult(existingWrapper, slotId, current.description, savedItem.url);
                         }
                     }
                     processedTags.add(tagKey);
@@ -682,17 +721,13 @@
                 wrapper.setAttribute("data-slot-id", slotId);
 
                 if (savedItem) {
-                    renderImageResult(wrapper, slotId, description, savedItem.url);
+                    renderImageResult(wrapper, slotId, current.description, savedItem.url);
                 } else {
-                    renderGenerateButton(wrapper, slotId, description);
+                    renderGenerateButton(wrapper, slotId, current.description);
                 }
 
-                if (!replaceTextWithNode(messageEl, fullMatch, wrapper)) {
-                    const fallbackInserted = injectNodeAfterText(messageEl, fullMatch, wrapper);
-                    if (!fallbackInserted) {
-                        messageEl.appendChild(wrapper);
-                    }
-                }
+                const replaced = replaceTextWithNodeAt(messageEl, current.index, current.length, wrapper) || replaceTextWithNode(messageEl, current.fullMatch, wrapper);
+                if (!replaced) continue;
 
                 processedTags.add(tagKey);
 

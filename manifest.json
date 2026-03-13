@@ -1,7 +1,7 @@
 {
     "display_name": "BizyAir Image Generator",
     "name": "bizyair-image-generator",
-    "version": "1.0.3",
+    "version": "1.0.4",
     "author": "Your Name",
     "description": "自动检测 image##描述## 格式并生成图片",
     "js": "index.js",
