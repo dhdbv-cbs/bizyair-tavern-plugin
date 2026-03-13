@@ -2,7 +2,7 @@
 // @name         BizyAir Image Generator
 // @namespace    http://tampermonkey.net/
 // @version      1.0.0
-// @description  自动检测 <image>描述</image> 格式并生成图片
+// @description  自动检测 image##描述## 格式并生成图片
 // @author       Your Name
 // @match        *://*/*
 // @grant        none
@@ -19,6 +19,7 @@
     let tempLocators = {};
     let messageObserver = null;
     let galleryData = [];
+    const isTouchDevice = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
     
     let imageParams = JSON.parse(localStorage.getItem("bizyair_params") || JSON.stringify({
         positivePrompt: "",
@@ -177,11 +178,12 @@
                 }
                 #bizyair-settings-modal .bizyair-view {
                     padding: 5px !important;
-                    max-height: calc(100vh - 120px) !important;
+                    padding-bottom: 50px !important;
                 }
                 #bizyair-settings-modal #bizyair-gallery-grid {
                     grid-template-columns: repeat(2, 1fr) !important;
                     gap: 8px !important;
+                    padding-bottom: 50px !important;
                 }
             }
             .bizyair-modal-header {
@@ -330,7 +332,7 @@
                     
                     <div style="margin: 15px 0; padding: 10px; background: #2a2a2a; border-radius: 4px;">
                         <label style="display:flex; align-items:center; gap: 10px; cursor: pointer;">
-                            <input type="checkbox" id="bizyair-random-seed" ${imageParams.randomSeed ? 'checked' : ''}>
+                            <input type="checkbox" id="bizyair-random-seed" ${imageParams.randomSeed ? 'checked' : ''} onchange="window.toggleRandomSeed(this.checked)">
                             <span style="color:#ddd; font-size:13px;">每次生图随机种子</span>
                         </label>
                     </div>
@@ -340,12 +342,13 @@
                 
                 <div id="bizyair-view-gallery" class="bizyair-view" style="display:none;padding:15px;overflow-y:auto;max-height:calc(90vh - 100px);">
                     <div style="display:flex;gap:10px;margin-bottom:15px;">
-                        <button class="bizyair-btn bizyair-btn-secondary" style="flex:1;" onclick="window.downloadAllGalleryImages()">📥 批量下载</button>
+                        <button class="bizyair-btn bizyair-btn-secondary" style="flex:1;" onclick="window.downloadAllGalleryImages()">📥 全部下载</button>
                         <button id="bizyair-edit-btn" class="bizyair-btn" style="flex:1;" onclick="window.toggleGalleryEditMode()">✏️ 编辑</button>
                         <button class="bizyair-btn" style="background:#ef4444;color:white;flex:1;" onclick="window.clearAllGallery()">🗑️ 清空</button>
                     </div>
                     <div id="bizyair-gallery-actions" style="display:none;gap:10px;margin-bottom:15px;padding:10px;background:#2a2a2a;border-radius:4px;">
                         <span style="color:#aaa;font-size:12px;flex:1;display:flex;align-items:center;">已选 <span id="bizyair-selected-count" style="color:#a855f7;margin:0 4px;">0</span> 张</span>
+                        <button class="bizyair-btn bizyair-btn-primary" style="padding:6px 12px;font-size:12px;" onclick="window.downloadSelectedGallery()">下载选中</button>
                         <button class="bizyair-btn" style="background:#ef4444;color:white;padding:6px 12px;font-size:12px;" onclick="window.deleteSelectedGallery()">删除选中</button>
                         <button class="bizyair-btn" style="padding:6px 12px;font-size:12px;" onclick="window.toggleGalleryEditMode()">取消</button>
                     </div>
@@ -380,6 +383,12 @@
         autoGenEnabled = checked;
         localStorage.setItem("bizyair_auto_gen", checked);
         showToast(checked ? "⚡ 自动生图已开启" : "⏸️ 自动生图已关闭");
+    };
+
+    window.toggleRandomSeed = function(checked) {
+        imageParams.randomSeed = checked;
+        localStorage.setItem("bizyair_params", JSON.stringify(imageParams));
+        showToast(checked ? "🎲 已启用随机种子" : "🔒 已关闭随机种子");
     };
 
     window.saveBizyairSettings = function() {
@@ -470,51 +479,232 @@
         return true;
     }
 
-    function scanAndInjectButtons() {
-        const messages = document.querySelectorAll('.mes_text');
-        if (messages.length === 0) return;
-        
-        const lastMessage = messages[messages.length - 1];
-        const text = lastMessage.innerText || "";
-        
-        const imageRegex = /image##([^#]+)##/g;
-        let match;
-        
-        while ((match = imageRegex.exec(text)) !== null) {
-            const fullMatch = match[0];
-            const tagKey = fullMatch;
-            
-            if (lastMessage.querySelector(`[data-bizyair-tag="${CSS.escape(tagKey)}"]`)) continue;
-            
-            const description = match[1].trim();
-            if (description) {
-                replaceTagWithButton(lastMessage, fullMatch, description, tagKey);
+    function replaceTextWithNode(rootElement, searchText, nodeToInject) {
+        let textMap = [];
+        let fullText = "";
+
+        function traverse(node) {
+            if (node.nodeType === Node.TEXT_NODE) {
+                for (let i = 0; i < node.nodeValue.length; i++) {
+                    textMap.push({ node: node, offset: i });
+                }
+                fullText += node.nodeValue;
+            } else {
+                node.childNodes.forEach(traverse);
             }
+        }
+
+        traverse(rootElement);
+        const startIdx = fullText.lastIndexOf(searchText);
+        if (startIdx === -1) return false;
+
+        const endIdx = startIdx + searchText.length - 1;
+        const startEntry = textMap[startIdx];
+        const endEntry = textMap[endIdx];
+        if (!startEntry || !endEntry) return false;
+
+        const range = document.createRange();
+        range.setStart(startEntry.node, startEntry.offset);
+        range.setEnd(endEntry.node, endEntry.offset + 1);
+        range.deleteContents();
+        range.insertNode(nodeToInject);
+        return true;
+    }
+
+    function getSlotIdFromTag(description, occurrenceKey) {
+        const raw = `${description}::${occurrenceKey}`;
+        let hash = 2166136261;
+        for (let i = 0; i < raw.length; i++) {
+            hash ^= raw.charCodeAt(i);
+            hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
+        }
+        const stableHash = (hash >>> 0).toString(36);
+        const safeKey = occurrenceKey.replace(/[^a-zA-Z0-9]/g, '');
+        return `slot_${safeKey}_${stableHash}`;
+    }
+
+    function getSavedGalleryItem(slotId) {
+        return galleryData.find(item => item && (item.slotId === slotId || item.id === slotId)) || null;
+    }
+
+    function persistGalleryCache(stripUrls) {
+        const cached = stripUrls
+            ? galleryData.map(item => ({ ...item, url: "" }))
+            : galleryData;
+        localStorage.setItem("bizyair_gallery", JSON.stringify(cached));
+    }
+
+    function isGalleryViewVisible() {
+        const galleryView = document.getElementById("bizyair-view-gallery");
+        return !!galleryView && galleryView.style.display !== "none";
+    }
+
+    function refreshGalleryUi() {
+        updateGalleryCount();
+        if (isGalleryViewVisible()) {
+            renderGallery();
         }
     }
 
-    function replaceTagWithButton(messageElement, fullMatch, description, tagKey) {
-        const btnId = `bizyair-btn-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-        
-        const wrapper = document.createElement("span");
+    function upsertGalleryItem(item, stripUrls) {
+        const existingIdx = galleryData.findIndex(galleryItem =>
+            galleryItem && (galleryItem.id === item.id || (item.slotId && galleryItem.slotId === item.slotId))
+        );
+
+        if (existingIdx !== -1) {
+            galleryData.splice(existingIdx, 1);
+        }
+
+        galleryData.unshift(item);
+        persistGalleryCache(stripUrls);
+        refreshGalleryUi();
+    }
+
+    function renderGenerateButton(wrapper, slotId, description, loadingText) {
+        const encodedDescription = encodeURIComponent(description);
         wrapper.className = "bizyair-inject-wrapper";
-        wrapper.setAttribute("data-bizyair-tag", tagKey);
-        
+        wrapper.setAttribute("data-slot-id", slotId);
         wrapper.innerHTML = `
-            <button id="${btnId}" class="bizyair-inject-btn" data-description="${encodeURIComponent(description)}" onclick="window.bizyairStartGenerate('${btnId}')">
-                <span>🖼️</span> 生成图片
+            <button class="bizyair-inject-btn${loadingText ? ' loading' : ''}" data-description="${encodedDescription}" data-slot-id="${slotId}" onclick="window.bizyairStartGenerate('${slotId}', this)">
+                <span>${loadingText ? '⏳' : '🖼️'}</span> ${loadingText || '生成图片'}
             </button>
         `;
-        
-        messageElement.innerHTML = messageElement.innerHTML.replace(fullMatch, wrapper.outerHTML);
-        
-        if (autoGenEnabled) {
-            setTimeout(() => window.bizyairStartGenerate(btnId), 300);
-        }
     }
-    
-    window.bizyairStartGenerate = function(btnId) {
-        const btn = document.getElementById(btnId);
+
+    function bindResultImageEvents(resultWrapper) {
+        if (!resultWrapper) return;
+
+        const img = resultWrapper.querySelector('.bizyair-result-img');
+        if (!img) return;
+
+        const slotId = resultWrapper.dataset.slotId;
+        let clickTimer = null;
+
+        img.onclick = function() {
+            if (clickTimer) {
+                clearTimeout(clickTimer);
+                clickTimer = null;
+                window.bizyairRegenerate(slotId);
+            } else {
+                clickTimer = setTimeout(function() {
+                    clickTimer = null;
+                    window.bizyairOpenGallery(img.src);
+                }, 500);
+            }
+        };
+    }
+
+    function renderImageResult(wrapper, slotId, description, imageUrl) {
+        const encodedDescription = encodeURIComponent(description);
+        wrapper.className = "bizyair-inject-wrapper";
+        wrapper.setAttribute("data-slot-id", slotId);
+        wrapper.innerHTML = `
+            <div class="bizyair-result-wrapper" data-slot-id="${slotId}" data-description="${encodedDescription}">
+                <img src="${imageUrl}" class="bizyair-result-img">
+                <div class="bizyair-prompt-display" style="font-size:11px;color:#888;margin-top:4px;">单击查看大图，双击重新生成</div>
+            </div>
+        `;
+
+        bindResultImageEvents(wrapper.querySelector('.bizyair-result-wrapper'));
+    }
+
+    function syncSavedImagesToWrappers() {
+        document.querySelectorAll('.bizyair-inject-wrapper[data-slot-id]').forEach(wrapper => {
+            const slotId = wrapper.dataset.slotId;
+            const savedItem = getSavedGalleryItem(slotId);
+            if (!savedItem) return;
+
+            const currentImg = wrapper.querySelector('.bizyair-result-img');
+            const resultWrapper = wrapper.querySelector('.bizyair-result-wrapper');
+            const button = wrapper.querySelector('button[data-description]');
+            if (button && button.classList.contains('loading')) return;
+
+            let description = savedItem.prompt || '';
+            if (resultWrapper && resultWrapper.dataset.description) {
+                description = decodeURIComponent(resultWrapper.dataset.description);
+            } else if (button && button.dataset.description) {
+                description = decodeURIComponent(button.dataset.description);
+            }
+
+            if (!currentImg || currentImg.src !== savedItem.url) {
+                renderImageResult(wrapper, slotId, description, savedItem.url);
+            }
+        });
+    }
+
+    function scanAndInjectButtons() {
+        const messages = document.querySelectorAll('.mes_text');
+        if (messages.length === 0) return;
+
+        syncSavedImagesToWrappers();
+
+        messages.forEach((messageEl, messageIndex) => {
+            const existingTags = messageEl.querySelectorAll('[data-bizyair-tag]');
+            const processedTags = new Set();
+            existingTags.forEach(el => {
+                processedTags.add(el.getAttribute('data-bizyair-tag'));
+            });
+
+            const imageRegex = /image##([^#]+)##/g;
+            let match;
+            const text = messageEl.innerText || "";
+
+            while ((match = imageRegex.exec(text)) !== null) {
+                const fullMatch = match[0];
+                const description = match[1].trim();
+                if (!description) continue;
+
+                const occurrenceKey = `${messageIndex}-${match.index}-${fullMatch.length}`;
+                const tagKey = `${fullMatch}@${occurrenceKey}`;
+
+                if (processedTags.has(tagKey)) continue;
+
+                const slotId = getSlotIdFromTag(description, occurrenceKey);
+                const existingWrapper = messageEl.querySelector(`.bizyair-inject-wrapper[data-slot-id="${slotId}"]`);
+                const savedItem = getSavedGalleryItem(slotId);
+
+                if (existingWrapper) {
+                    if (savedItem) {
+                        const loadingButton = existingWrapper.querySelector('button.loading');
+                        if (loadingButton) continue;
+
+                        const currentImg = existingWrapper.querySelector('.bizyair-result-img');
+                        if (!currentImg || currentImg.src !== savedItem.url) {
+                            renderImageResult(existingWrapper, slotId, description, savedItem.url);
+                        }
+                    }
+                    processedTags.add(tagKey);
+                    continue;
+                }
+
+                const wrapper = document.createElement("span");
+                wrapper.setAttribute("data-bizyair-tag", tagKey);
+                wrapper.setAttribute("data-slot-id", slotId);
+
+                if (savedItem) {
+                    renderImageResult(wrapper, slotId, description, savedItem.url);
+                } else {
+                    renderGenerateButton(wrapper, slotId, description);
+                }
+
+                if (!replaceTextWithNode(messageEl, fullMatch, wrapper)) {
+                    const fallbackInserted = injectNodeAfterText(messageEl, fullMatch, wrapper);
+                    if (!fallbackInserted) {
+                        messageEl.appendChild(wrapper);
+                    }
+                }
+
+                processedTags.add(tagKey);
+
+                if (autoGenEnabled && !savedItem) {
+                    setTimeout(() => window.bizyairStartGenerate(slotId), 300);
+                }
+            }
+        });
+    }
+
+    window.bizyairStartGenerate = function(slotId, explicitBtn) {
+        const btn = explicitBtn || document.querySelector(`button[data-slot-id="${slotId}"]`);
         if (!btn) return;
         
         const description = decodeURIComponent(btn.dataset.description);
@@ -524,15 +714,15 @@
         btn.onclick = function() {
             btn.innerHTML = `<span>🖼️</span> 生成图片`;
             btn.classList.remove("loading");
-            btn.onclick = function() { window.bizyairStartGenerate(btnId); };
+            btn.onclick = function() { window.bizyairStartGenerate(slotId, btn); };
             showToast("⏹️ 已取消生成");
         };
         
-        autoGenerateImage(btnId, description);
+        autoGenerateImage(slotId, description);
     }
 
-    async function autoGenerateImage(btnId, description) {
-        const btn = document.getElementById(btnId);
+    async function autoGenerateImage(slotId, description) {
+        const btn = document.querySelector(`button[data-slot-id="${slotId}"]`);
         if (!btn) return;
         
         try {
@@ -542,16 +732,13 @@
             if (result && result.outputs && Array.isArray(result.outputs) && result.outputs.length > 0) {
                 const imageUrl = getFinalImage(result.outputs);
                 if (imageUrl) {
-                    showImageResult(btnId, imageUrl);
+                    showImageResult(slotId, imageUrl);
                 } else {
                     throw new Error("无法获取图片地址");
                 }
             } else if (result && result.request_id) {
                 btn.innerHTML = `<span>⏳</span> 等待图片...`;
-                await pollForResult(result.request_id, btn);
-            } else if (result && result.request_id) {
-                btn.innerHTML = `<span>⏳</span> 等待图片...`;
-                await pollForResult(result.request_id, btn);
+                await pollForResult(result.request_id, slotId);
             } else {
                 console.log("BizyAir response:", result);
                 throw new Error("未获取到图片地址");
@@ -564,23 +751,23 @@
         }
     }
 
-    function showImageResult(btnId, imageUrl) {
-        const btn = document.getElementById(btnId);
-        if (!btn) return;
-        
-        const description = btn.dataset.description || '';
-        const safeDesc = decodeURIComponent(description);
-        const wrapper = btn.parentElement;
-        wrapper.innerHTML = `
-            <img src="${imageUrl}" class="bizyair-result-img" 
-                onclick="window.bizyairOpenGallery('${imageUrl}')"
-                ondblclick="window.bizyairRegenerate('${imageUrl}', '${encodeURIComponent(safeDesc)}')">
-            <div class="bizyair-prompt-display" style="font-size:11px;color:#888;margin-top:4px;">双击图片重新生成 | Prompt: ${safeDesc}</div>
-        `;
-        
-        saveToGallery(imageUrl, safeDesc);
-        updateGalleryCount();
-        
+    function showImageResult(slotId, imageUrl) {
+        const wrapper = document.querySelector(`.bizyair-inject-wrapper[data-slot-id="${slotId}"]`);
+        if (!wrapper) return;
+
+        const button = wrapper.querySelector(`button[data-slot-id="${slotId}"]`);
+        const resultWrapper = wrapper.querySelector('.bizyair-result-wrapper');
+        let description = "";
+
+        if (button && button.dataset.description) {
+            description = decodeURIComponent(button.dataset.description);
+        } else if (resultWrapper && resultWrapper.dataset.description) {
+            description = decodeURIComponent(resultWrapper.dataset.description);
+        }
+
+        renderImageResult(wrapper, slotId, description, imageUrl);
+        saveToGallery(imageUrl, description, slotId);
+
         showToast("✅ 图片生成成功");
     }
 
@@ -605,7 +792,18 @@
         });
     }
     
-    async function saveToGallery(url, prompt) {
+    async function saveToGallery(url, prompt, slotId) {
+        const itemId = slotId || 'gal_' + Date.now();
+        const previewItem = {
+            id: itemId,
+            slotId: slotId,
+            url: url,
+            prompt: prompt,
+            timestamp: Date.now()
+        };
+
+        upsertGalleryItem(previewItem, false);
+
         try {
             const response = await fetch(url);
             const blob = await response.blob();
@@ -613,63 +811,91 @@
             reader.onloadend = async function() {
                 const base64 = reader.result;
                 const item = {
-                    id: 'gal_' + Date.now(),
+                    id: itemId,
+                    slotId: slotId,
                     url: base64,
                     prompt: prompt,
-                    timestamp: Date.now()
+                    timestamp: previewItem.timestamp
                 };
                 
-                if (!db) await initDB();
-                const transaction = db.transaction([STORE_NAME], 'readwrite');
-                const store = transaction.objectStore(STORE_NAME);
-                store.add(item);
-                
-                galleryData.unshift(item);
-                localStorage.setItem("bizyair_gallery", JSON.stringify(galleryData.map(g => ({...g, url: ''}))));
-                updateGalleryCount();
+                try {
+                    if (!db) await initDB();
+                    if (db) {
+                        const transaction = db.transaction([STORE_NAME], 'readwrite');
+                        const store = transaction.objectStore(STORE_NAME);
+                        store.put(item);
+                    }
+                    upsertGalleryItem(item, true);
+                } catch (dbError) {
+                    console.error("保存到数据库失败:", dbError);
+                    upsertGalleryItem(item, false);
+                }
             };
             reader.readAsDataURL(blob);
         } catch (e) {
             console.error("保存图片失败:", e);
-            const item = {
-                id: 'gal_' + Date.now(),
-                url: url,
-                prompt: prompt,
-                timestamp: Date.now()
-            };
-            galleryData.unshift(item);
-            localStorage.setItem("bizyair_gallery", JSON.stringify(galleryData));
-            updateGalleryCount();
         }
     }
     
     async function loadGalleryFromDB() {
-        if (!db) await initDB();
-        
-        const transaction = db.transaction([STORE_NAME], 'readonly');
-        const store = transaction.objectStore(STORE_NAME);
-        const request = store.getAll();
-        
-        return new Promise((resolve) => {
-            request.onsuccess = () => {
-                const items = request.result;
-                if (items && items.length > 0) {
-                    galleryData = items.sort((a, b) => b.timestamp - a.timestamp);
-                }
-                resolve();
-            };
-        });
+        if (!db) {
+            try {
+                await initDB();
+            } catch (e) {
+                console.warn("初始化图库数据库失败，回退到 localStorage:", e);
+            }
+        }
+
+        if (db) {
+            const transaction = db.transaction([STORE_NAME], 'readonly');
+            const store = transaction.objectStore(STORE_NAME);
+            const request = store.getAll();
+
+            return new Promise((resolve) => {
+                request.onsuccess = () => {
+                    const items = request.result;
+                    if (items && items.length > 0) {
+                        galleryData = items.sort((a, b) => b.timestamp - a.timestamp);
+                    } else {
+                        galleryData = loadGalleryFromLocalCache();
+                    }
+                    refreshGalleryUi();
+                    resolve();
+                };
+                request.onerror = () => {
+                    galleryData = loadGalleryFromLocalCache();
+                    refreshGalleryUi();
+                    resolve();
+                };
+            });
+        }
+
+        galleryData = loadGalleryFromLocalCache();
+        refreshGalleryUi();
+    }
+
+    function loadGalleryFromLocalCache() {
+        try {
+            const cached = JSON.parse(localStorage.getItem("bizyair_gallery") || "[]");
+            return cached
+                .filter(item => item && item.url)
+                .sort((a, b) => b.timestamp - a.timestamp);
+        } catch (e) {
+            console.error("读取本地画廊缓存失败:", e);
+            return [];
+        }
     }
     
     function updateGalleryCount() {
         const modal = document.getElementById("bizyair-settings-modal");
         if (modal) {
-            const btn = modal.querySelector('.bizyair-btn-secondary');
-            if (btn) btn.innerHTML = `🖼️ 画廊 (${galleryData.length})`;
+            const tab = modal.querySelector('.bizyair-tab[data-tab="gallery"]');
+            if (tab) tab.innerHTML = `🖼️ 画廊 (${galleryData.length})`;
         }
     }
 
-    async function pollForResult(taskId, btn) {
+    async function pollForResult(taskId, slotId) {
+        const btn = document.querySelector(`button[data-slot-id="${slotId}"]`);
         const maxAttempts = 60;
         let attempts = 0;
         
@@ -689,18 +915,7 @@
                 if (data.status === 'Success' && data.outputs && Array.isArray(data.outputs) && data.outputs.length > 0) {
                     const imageUrl = getFinalImage(data.outputs);
                     if (!imageUrl) continue;
-                    const description = btn.dataset.description || '';
-                    const safeDesc = decodeURIComponent(description);
-                    const wrapper = btn.parentElement;
-                    wrapper.innerHTML = `
-                        <img src="${imageUrl}" class="bizyair-result-img" 
-                            onclick="window.bizyairOpenGallery('${imageUrl}')"
-                            ondblclick="window.bizyairRegenerate('${imageUrl}', '${encodeURIComponent(safeDesc)}')">
-                        <div class="bizyair-prompt-display" style="font-size:11px;color:#888;margin-top:4px;">双击图片重新生成 | Prompt: ${safeDesc}</div>
-                    `;
-                    saveToGallery(imageUrl, safeDesc);
-                    updateGalleryCount();
-                    showToast("✅ 图片生成成功");
+                    showImageResult(slotId, imageUrl);
                     return;
                 } else if (data.status === 'failed') {
                     throw new Error(data.error || "生成失败");
@@ -712,15 +927,21 @@
             attempts++;
         }
         
-        btn.innerHTML = `<span>⏱️</span> 超时`;
-        btn.classList.remove("loading");
+        if (btn) {
+            btn.innerHTML = `<span>⏱️</span> 超时`;
+            btn.classList.remove("loading");
+        }
         showToast("⏱️ 等待超时");
     }
 
     function getCurrentParams() {
         const stored = JSON.parse(localStorage.getItem("bizyair_params") || JSON.stringify(imageParams));
+        const seedValue = stored.randomSeed
+            ? Math.floor(Math.random() * 1000000000000000)
+            : parseInt(stored.seed);
+
         return {
-            "27:KSampler.seed": stored.randomSeed ? Math.floor(Math.random() * 1000000000000000) : parseInt(stored.seed),
+            "27:KSampler.seed": seedValue,
             "27:KSampler.steps": parseInt(stored.steps),
             "27:KSampler.sampler_name": stored.sampler,
             "61:CM_SDXLExtendedResolution.resolution": `${stored.width}x${stored.height}`,
@@ -744,7 +965,8 @@
 
     async function generateImage(description) {
         const params = getCurrentParams();
-        params["93:CLIPTextEncode.text"] = description;
+        const stored = JSON.parse(localStorage.getItem("bizyair_params") || JSON.stringify(imageParams));
+        params["31:CLIPTextEncode.text"] = (stored.positivePrompt || "") + (description ? ", " + description : "");
         
         const response = await fetch('https://api.bizyair.cn/w/v1/webapp/task/openapi/create', {
             method: 'POST',
@@ -789,44 +1011,16 @@
         document.body.appendChild(gallery);
     };
 
-    window.bizyairRegenerate = async function(oldUrl, encodedDesc) {
-        const description = decodeURIComponent(encodedDesc);
-        const images = document.querySelectorAll(`.bizyair-result-img[src="${oldUrl}"]`);
-        
-        for (const img of images) {
-            const wrapper = img.parentElement;
-            const btnId = `bizyair-btn-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-            wrapper.innerHTML = `
-                <button id="${btnId}" class="bizyair-inject-btn loading" data-description="${encodeURIComponent(description)}">
-                    <span>⏳</span> 重新生成中...
-                </button>
-                <div class="bizyair-prompt-display" style="font-size:11px;color:#888;margin-top:4px;">双击图片重新生成 | Prompt: ${description}</div>
-            `;
-            
-            try {
-                const result = await generateImage(description);
-                console.log("Regenerate result:", result);
-                
-                if (result && result.outputs && Array.isArray(result.outputs) && result.outputs.length > 0) {
-                    const imageUrl = getFinalImage(result.outputs);
-                    if (imageUrl) {
-                        wrapper.innerHTML = `
-                            <img src="${imageUrl}" class="bizyair-result-img" 
-                                onclick="window.bizyairOpenGallery('${imageUrl}')"
-                                ondblclick="window.bizyairRegenerate('${imageUrl}', '${encodeURIComponent(description)}')">
-                            <div class="bizyair-prompt-display" style="font-size:11px;color:#888;margin-top:4px;">双击图片重新生成 | Prompt: ${description}</div>
-                        `;
-                        saveToGallery(imageUrl, description);
-                        updateGalleryCount();
-                    }
-                } else if (result && result.request_id) {
-                    await pollForResult(result.request_id, document.getElementById(btnId));
-                }
-            } catch (error) {
-                console.error("Regenerate error:", error);
-                showToast("❌ 重新生成失败");
-            }
-        }
+    window.bizyairRegenerate = function(slotId) {
+        const wrapper = document.querySelector(`.bizyair-inject-wrapper[data-slot-id="${slotId}"]`);
+        const resultWrapper = wrapper ? wrapper.querySelector('.bizyair-result-wrapper') : null;
+        if (!wrapper || !resultWrapper) return;
+
+        const encodedDescription = resultWrapper.dataset.description || "";
+        const description = encodedDescription ? decodeURIComponent(encodedDescription) : "";
+
+        renderGenerateButton(wrapper, slotId, description, "重新生成中...");
+        setTimeout(() => window.bizyairStartGenerate(slotId), 0);
     };
 
     function initObserver() {
@@ -931,8 +1125,7 @@
         document.getElementById('bizyair-edit-btn').style.background = '';
         document.getElementById('bizyair-gallery-actions').style.display = 'none';
         
-        renderGallery();
-        updateGalleryCount();
+        refreshGalleryUi();
         showToast(`🗑️ 已删除 ${sortedIdx.length} 张图片`);
     }
     
@@ -949,23 +1142,86 @@
         if (!item) return;
         window.bizyairOpenGallery(item.url);
     }
-    
-    window.downloadBizyairImage = function(idx) {
-        const item = galleryData[idx];
-        if (!item) return;
-        
+
+    function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function triggerImageDownload(item, fallbackName) {
+        const fileName = `bizyair_${item.id || fallbackName}.png`;
+        let objectUrl = null;
+
         try {
+            if (item.url && item.url.startsWith('data:')) {
+                const a = document.createElement("a");
+                a.href = item.url;
+                a.download = fileName;
+                a.rel = "noopener noreferrer";
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                return true;
+            }
+
+            const response = await fetch(item.url, { mode: 'cors' });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const blob = await response.blob();
+            objectUrl = URL.createObjectURL(blob);
+
             const a = document.createElement("a");
-            a.href = item.url;
-            a.download = `bizyair_${item.id}.png`;
+            a.href = objectUrl;
+            a.download = fileName;
+            a.rel = "noopener noreferrer";
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
-            showToast("✅ 下载成功");
+            return true;
         } catch (e) {
             console.error("下载失败:", e);
-            showToast("❌ 下载失败");
+            try {
+                window.open(item.url, '_blank', 'noopener,noreferrer');
+            } catch (_) {}
+            return false;
+        } finally {
+            if (objectUrl) {
+                setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+            }
         }
+    }
+
+    async function downloadGalleryItems(items, label) {
+        if (!items || items.length === 0) {
+            showToast("没有可下载的图片");
+            return;
+        }
+
+        showToast(`📥 开始下载 ${items.length} 张图片...`);
+        let okCount = 0;
+
+        for (let i = 0; i < items.length; i++) {
+            const success = await triggerImageDownload(items[i], `item_${i + 1}`);
+            if (success) okCount++;
+
+            if (isTouchDevice) {
+                await sleep(700);
+            } else {
+                await sleep(180);
+            }
+        }
+
+        if (okCount === items.length) {
+            showToast(`✅ ${label}下载完成`);
+        } else {
+            showToast(`⚠️ ${label}完成（成功 ${okCount}/${items.length}）`);
+        }
+    }
+    
+    window.downloadBizyairImage = async function(idx) {
+        const item = galleryData[idx];
+        if (!item) return;
+
+        const success = await triggerImageDownload(item, `single_${idx + 1}`);
+        showToast(success ? "✅ 下载成功" : "⚠️ 已尝试下载，请检查浏览器下载权限");
     }
     
     window.deleteBizyairImage = async function(idx) {
@@ -980,33 +1236,22 @@
         
         galleryData.splice(idx, 1);
         localStorage.setItem("bizyair_gallery", JSON.stringify(galleryData));
-        renderGallery();
-        updateGalleryCount();
+        refreshGalleryUi();
     }
     
-    window.downloadAllGalleryImages = function() {
-        if (galleryData.length === 0) return showToast("没有可下载的图片");
-        
-        showToast(`📥 开始下载 ${galleryData.length} 张图片...`);
-        
-        galleryData.forEach((item, i) => {
-            setTimeout(() => {
-                try {
-                    const a = document.createElement("a");
-                    a.href = item.url;
-                    a.download = `bizyair_${item.id}.png`;
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                } catch (e) {
-                    console.error("下载失败:", e);
-                }
-            }, i * 300);
-        });
-        
-        setTimeout(() => {
-            showToast("✅ 下载完成");
-        }, galleryData.length * 300 + 500);
+    window.downloadSelectedGallery = async function() {
+        if (gallerySelected.size === 0) return showToast('请先选择要下载的图片');
+
+        const selectedItems = Array.from(gallerySelected)
+            .sort((a, b) => a - b)
+            .map(idx => galleryData[idx])
+            .filter(Boolean);
+
+        await downloadGalleryItems(selectedItems, '选中图片');
+    }
+
+    window.downloadAllGalleryImages = async function() {
+        await downloadGalleryItems(galleryData, '全部图片');
     }
     
     window.clearAllGallery = function() {
@@ -1020,8 +1265,7 @@
         
         galleryData = [];
         localStorage.setItem("bizyair_gallery", JSON.stringify(galleryData));
-        renderGallery();
-        updateGalleryCount();
+        refreshGalleryUi();
         showToast("🗑️ 画廊已清空");
     }
 
@@ -1031,12 +1275,13 @@
         createSettingsModal();
         
         initDB().then(() => {
-            loadGalleryFromDB();
+            loadGalleryFromDB().then(() => {
+                scanAndInjectButtons();
+            });
         });
         
         setInterval(checkSidebarButton, 1000);
         
-        scanAndInjectButtons();
         checkSidebarButton();
         initObserver();
         
