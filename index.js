@@ -645,13 +645,13 @@
                 processedTags.add(el.getAttribute('data-bizyair-tag'));
             });
 
-            const imageRegex = /image##([^#]+)##/g;
+            const imageRegex = /&lt;image&gt;image##([^#]+)##&lt;\/image&gt;|<image>image##([^#]+)##<\/image>|image##([^#]+)##/g;
             let match;
-            const text = messageEl.innerText || "";
+            const text = messageEl.innerHTML || "";
 
             while ((match = imageRegex.exec(text)) !== null) {
                 const fullMatch = match[0];
-                const description = match[1].trim();
+                const description = (match[1] || match[2] || match[3] || "").trim();
                 if (!description) continue;
 
                 const occurrenceKey = `${messageIndex}-${match.index}-${fullMatch.length}`;
