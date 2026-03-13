@@ -482,21 +482,23 @@
         
         while ((match = imageRegex.exec(text)) !== null) {
             const fullMatch = match[0];
+            const tagKey = fullMatch;
             
-            if (lastMessage.querySelector('.bizyair-inject-wrapper')) continue;
+            if (lastMessage.querySelector(`[data-bizyair-tag="${CSS.escape(tagKey)}"]`)) continue;
             
             const description = match[1].trim();
             if (description) {
-                replaceTagWithButton(lastMessage, fullMatch, description);
+                replaceTagWithButton(lastMessage, fullMatch, description, tagKey);
             }
         }
     }
 
-    function replaceTagWithButton(messageElement, fullMatch, description) {
+    function replaceTagWithButton(messageElement, fullMatch, description, tagKey) {
         const btnId = `bizyair-btn-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
         
         const wrapper = document.createElement("span");
         wrapper.className = "bizyair-inject-wrapper";
+        wrapper.setAttribute("data-bizyair-tag", tagKey);
         
         wrapper.innerHTML = `
             <button id="${btnId}" class="bizyair-inject-btn" data-description="${encodeURIComponent(description)}" onclick="window.bizyairStartGenerate('${btnId}')">
