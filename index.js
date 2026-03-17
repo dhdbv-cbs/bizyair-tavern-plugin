@@ -12,41 +12,863 @@
     'use strict';
 
     const extensionName = "bizyair-image-generator";
-    
+
+    const DEFAULT_NEGATIVE_PROMPT_LEGACY = "blurry, noisy, messy, lowres, jpeg, artifacts, ill, distorted, malformed, text, watermark, signature, username, artist name, logo";
+    const DEFAULT_NEGATIVE_PROMPT_FACE = "text, watermark,worst quality.multiple views";
+    const DEFAULT_NEGATIVE_PROMPT_ZIMAGE = "blurry ugly bad";
+
+    const BASE_TEMPLATES = {
+        legacy: {
+            id: "legacy",
+            label: "二次元简单生图 (44306)",
+            defaultWebAppId: 44306,
+            outputIndexFromEnd: 1,
+            positivePromptKey: "31:CLIPTextEncode.text",
+            negativePromptKey: "32:CLIPTextEncode.text",
+            defaultParams: {
+                positivePrompt: "",
+                negativePrompt: DEFAULT_NEGATIVE_PROMPT_LEGACY,
+                width: 832,
+                height: 1216,
+                steps: 20,
+                seed: 101,
+                cfg: 8,
+                sampler: "euler_ancestral",
+                scaleBy: 1.2,
+                randomSeed: true,
+                scheduler: "",
+                denoise: "",
+                aspectRatio: "",
+                resolution: ""
+            },
+            buildParams: (stored, seedValue) => ({
+                "27:KSampler.seed": seedValue,
+                "27:KSampler.steps": parseInt(stored.steps),
+                "27:KSampler.sampler_name": stored.sampler,
+                "61:CM_SDXLExtendedResolution.resolution": `${stored.width}x${stored.height}`,
+                "69:DF_Latent_Scale_by_ratio.modifier": parseFloat(stored.scaleBy),
+                "31:CLIPTextEncode.text": stored.positivePrompt || "",
+                "32:CLIPTextEncode.text": stored.negativePrompt || "",
+                "54:EmptyLatentImage.batch_size": 1,
+                "57:dynamicThresholdingFull.mimic_scale": parseFloat(stored.cfg)
+            })
+        },
+        face_detailer: {
+            id: "face_detailer",
+            label: "二次元精修生图 (47362)",
+            defaultWebAppId: 47362,
+            outputIndexFromEnd: 1,
+            positivePromptKey: "93:CLIPTextEncode.text",
+            negativePromptKey: "55:CLIPTextEncode.text",
+            defaultParams: {
+                positivePrompt: "",
+                negativePrompt: DEFAULT_NEGATIVE_PROMPT_FACE,
+                width: 960,
+                height: 1280,
+                steps: 20,
+                seed: 101,
+                cfg: 7,
+                sampler: "euler",
+                scaleBy: 1.5,
+                randomSeed: true,
+                scheduler: "simple",
+                denoise: "",
+                aspectRatio: "",
+                resolution: ""
+            },
+            buildParams: (stored, seedValue) => ({
+                "93:CLIPTextEncode.text": stored.positivePrompt || "",
+                "55:CLIPTextEncode.text": stored.negativePrompt || "",
+                "47:EmptyLatentImage.width": parseInt(stored.width),
+                "47:EmptyLatentImage.height": parseInt(stored.height),
+                "47:EmptyLatentImage.batch_size": 1,
+                "89:FaceDetailer.steps": parseInt(stored.steps),
+                "89:FaceDetailer.seed": seedValue,
+                "89:FaceDetailer.cfg": parseFloat(stored.cfg),
+                "89:FaceDetailer.sampler_name": stored.sampler,
+                "89:FaceDetailer.scheduler": stored.scheduler || "simple",
+                "74:LatentUpscaleBy.scale_by": parseFloat(stored.scaleBy)
+            })
+        },
+        zimage: {
+            id: "zimage",
+            label: "zimage生图 (48570)",
+            defaultWebAppId: 48570,
+            outputIndexFromEnd: 1,
+            positivePromptKey: "6:CLIPTextEncode.text",
+            negativePromptKey: "7:CLIPTextEncode.text",
+            defaultParams: {
+                positivePrompt: "",
+                negativePrompt: DEFAULT_NEGATIVE_PROMPT_ZIMAGE,
+                width: 1024,
+                height: 1024,
+                steps: 10,
+                seed: 101,
+                cfg: 1,
+                sampler: "euler",
+                scaleBy: 1,
+                randomSeed: true,
+                scheduler: "simple",
+                denoise: 1,
+                aspectRatio: "",
+                resolution: ""
+            },
+            buildParams: (stored, seedValue) => ({
+                "3:KSampler.seed": seedValue,
+                "3:KSampler.steps": parseInt(stored.steps),
+                "3:KSampler.cfg": parseFloat(stored.cfg),
+                "3:KSampler.sampler_name": stored.sampler,
+                "3:KSampler.scheduler": stored.scheduler || "simple",
+                "3:KSampler.denoise": parseFloat(stored.denoise ?? 1),
+                "6:CLIPTextEncode.text": stored.positivePrompt || "",
+                "7:CLIPTextEncode.text": stored.negativePrompt || "",
+                "13:EmptySD3LatentImage.width": parseInt(stored.width),
+                "13:EmptySD3LatentImage.height": parseInt(stored.height),
+                "13:EmptySD3LatentImage.batch_size": 1
+            })
+        },
+        flux: {
+            id: "flux",
+            label: "flux生图 (44324)",
+            defaultWebAppId: 44324,
+            outputIndexFromEnd: 1,
+            positivePromptKey: "76:PrimitiveStringMultiline.value",
+            negativePromptKey: null,
+            defaultParams: {
+                positivePrompt: "",
+                negativePrompt: "",
+                width: 1024,
+                height: 1536,
+                steps: 10,
+                seed: 101,
+                cfg: 1,
+                sampler: "euler",
+                scaleBy: 1,
+                randomSeed: true,
+                scheduler: "",
+                denoise: "",
+                aspectRatio: "",
+                resolution: ""
+            },
+            buildParams: (stored) => ({
+                "76:PrimitiveStringMultiline.value": stored.positivePrompt || "",
+                "84:PrimitiveInt.value": parseInt(stored.width),
+                "85:PrimitiveInt.value": parseInt(stored.height),
+                "83:EmptyFlux2LatentImage.batch_size": 1
+            })
+        }
+    };
+
+    const LEGACY_WEB_APP_KEY = "bizyair_web_app_id";
+    const TEMPLATE_WEB_APP_PREFIX = "bizyair_web_app_id_";
+    const TEMPLATE_PARAMS_PREFIX = "bizyair_params_";
+    const CUSTOM_TEMPLATES_KEY = "bizyair_custom_templates";
+    const SLOT_SELECTION_KEY = "bizyair_slot_selection";
+
+    function deepClone(value) {
+        return JSON.parse(JSON.stringify(value));
+    }
+
+    function loadCustomTemplateDefs() {
+        const raw = localStorage.getItem(CUSTOM_TEMPLATES_KEY);
+        if (!raw) return [];
+        try {
+            const parsed = JSON.parse(raw);
+            return Array.isArray(parsed) ? parsed : [];
+        } catch (e) {
+            console.warn("读取自定义模板失败:", e);
+            return [];
+        }
+    }
+
+    function saveCustomTemplateDefs(defs) {
+        localStorage.setItem(CUSTOM_TEMPLATES_KEY, JSON.stringify(defs));
+    }
+
+    function buildCustomTemplate(def) {
+        const baseInput = def.baseInput || {};
+        const paramKeyMap = def.paramKeyMap || {};
+        const defaultParams = def.defaultParams || buildDefaultParamsFromInput(
+            baseInput,
+            paramKeyMap,
+            { positiveKey: def.positivePromptKey, negativeKey: def.negativePromptKey }
+        );
+        return {
+            id: def.id,
+            label: def.label || def.id,
+            defaultWebAppId: def.webAppId,
+            outputIndexFromEnd: def.outputIndexFromEnd || 1,
+            positivePromptKey: def.positivePromptKey || null,
+            negativePromptKey: def.negativePromptKey || null,
+            suppressPreviewOutput: def.suppressPreviewOutput !== undefined ? def.suppressPreviewOutput : true,
+            defaultParams,
+            buildParams: (stored, seedValue) => {
+                const params = deepClone(baseInput);
+
+                const applyNumber = (key, value) => {
+                    const num = Number(value);
+                    if (Number.isFinite(num)) {
+                        params[key] = num;
+                    }
+                };
+
+                if (paramKeyMap.seed) params[paramKeyMap.seed] = seedValue;
+                if (paramKeyMap.steps && stored.steps !== undefined && stored.steps !== "") {
+                    applyNumber(paramKeyMap.steps, stored.steps);
+                }
+                if (paramKeyMap.cfg && stored.cfg !== undefined && stored.cfg !== "") {
+                    applyNumber(paramKeyMap.cfg, stored.cfg);
+                }
+                if (paramKeyMap.sampler && stored.sampler) params[paramKeyMap.sampler] = stored.sampler;
+                if (paramKeyMap.scheduler && stored.scheduler) params[paramKeyMap.scheduler] = stored.scheduler;
+                if (paramKeyMap.denoise && stored.denoise !== undefined && stored.denoise !== "") {
+                    applyNumber(paramKeyMap.denoise, stored.denoise);
+                }
+                if (paramKeyMap.scaleBy && stored.scaleBy !== undefined && stored.scaleBy !== "") {
+                    applyNumber(paramKeyMap.scaleBy, stored.scaleBy);
+                }
+                if (paramKeyMap.width && stored.width !== undefined && stored.width !== "") {
+                    applyNumber(paramKeyMap.width, stored.width);
+                }
+                if (paramKeyMap.height && stored.height !== undefined && stored.height !== "") {
+                    applyNumber(paramKeyMap.height, stored.height);
+                }
+                if (paramKeyMap.aspectRatio && stored.aspectRatio) params[paramKeyMap.aspectRatio] = stored.aspectRatio;
+                if (paramKeyMap.resolution && stored.resolution) params[paramKeyMap.resolution] = stored.resolution;
+
+                return params;
+            }
+        };
+    }
+
+    function buildCustomTemplatesMap(defs) {
+        const map = {};
+        defs.forEach(def => {
+            if (def && def.id) {
+                map[def.id] = buildCustomTemplate(def);
+            }
+        });
+        return map;
+    }
+
+    let customTemplateDefs = loadCustomTemplateDefs();
+    let customTemplates = buildCustomTemplatesMap(customTemplateDefs);
+
+    function refreshCustomTemplates() {
+        customTemplateDefs = loadCustomTemplateDefs();
+        customTemplates = buildCustomTemplatesMap(customTemplateDefs);
+    }
+
+    function getAllTemplates() {
+        return { ...BASE_TEMPLATES, ...customTemplates };
+    }
+
+    function normalizeTemplateId(templateId) {
+        const templates = getAllTemplates();
+        return templateId && templates[templateId] ? templateId : "legacy";
+    }
+
+    function getTemplateDef(templateId) {
+        return getAllTemplates()[normalizeTemplateId(templateId)];
+    }
+
+    function getWebAppIdStorageKey(templateId) {
+        return `${TEMPLATE_WEB_APP_PREFIX}${templateId}`;
+    }
+
+    function getWebAppIdForTemplate(templateId) {
+        const normalized = normalizeTemplateId(templateId);
+        const perTemplateKey = getWebAppIdStorageKey(normalized);
+        const perTemplateValue = localStorage.getItem(perTemplateKey);
+        if (perTemplateValue) return perTemplateValue;
+
+        if (normalized === "legacy") {
+            const legacyValue = localStorage.getItem(LEGACY_WEB_APP_KEY);
+            if (legacyValue) {
+                localStorage.setItem(perTemplateKey, legacyValue);
+                return legacyValue;
+            }
+        }
+
+        return String(getTemplateDef(normalized).defaultWebAppId);
+    }
+
+    function setWebAppIdForTemplate(templateId, value) {
+        const normalized = normalizeTemplateId(templateId);
+        const perTemplateKey = getWebAppIdStorageKey(normalized);
+        localStorage.setItem(perTemplateKey, value);
+
+        if (normalized === "legacy") {
+            localStorage.setItem(LEGACY_WEB_APP_KEY, value);
+        }
+    }
+
+    function getParamsStorageKey(templateId) {
+        return `${TEMPLATE_PARAMS_PREFIX}${normalizeTemplateId(templateId)}`;
+    }
+
+    function cloneParams(value) {
+        return deepClone(value);
+    }
+
+    function getTemplateDefaultParams(templateId) {
+        return cloneParams(getTemplateDef(templateId).defaultParams || {});
+    }
+
+    function loadTemplateParams(templateId) {
+        const normalized = normalizeTemplateId(templateId);
+        const defaults = getTemplateDefaultParams(normalized);
+        const key = getParamsStorageKey(normalized);
+        let raw = localStorage.getItem(key);
+
+        if (!raw && normalized === "legacy") {
+            const legacyRaw = localStorage.getItem("bizyair_params");
+            if (legacyRaw) {
+                localStorage.setItem(key, legacyRaw);
+                raw = legacyRaw;
+            }
+        }
+
+        if (!raw) return defaults;
+
+        try {
+            const parsed = JSON.parse(raw);
+            return { ...defaults, ...parsed };
+        } catch (e) {
+            console.warn("读取模板参数失败，使用默认值:", e);
+            return defaults;
+        }
+    }
+
+    function saveTemplateParams(templateId, params) {
+        const normalized = normalizeTemplateId(templateId);
+        const key = getParamsStorageKey(normalized);
+        const payload = JSON.stringify(params);
+        localStorage.setItem(key, payload);
+
+        if (normalized === "legacy") {
+            localStorage.setItem("bizyair_params", payload);
+        }
+    }
+
+    function applyParamsToUI(params) {
+        const mapValue = (id, value) => {
+            const el = document.getElementById(id);
+            if (el) el.value = value ?? "";
+        };
+        mapValue("bizyair-width", params.width);
+        mapValue("bizyair-height", params.height);
+        mapValue("bizyair-steps", params.steps);
+        mapValue("bizyair-seed", params.seed);
+        mapValue("bizyair-scale", params.scaleBy);
+        mapValue("bizyair-cfg", params.cfg);
+        mapValue("bizyair-sampler", params.sampler);
+        mapValue("bizyair-pos-prompt", params.positivePrompt || "");
+        mapValue("bizyair-neg-prompt", params.negativePrompt || "");
+        mapValue("bizyair-scheduler", params.scheduler || "");
+        mapValue("bizyair-denoise", params.denoise !== undefined ? params.denoise : "");
+        mapValue("bizyair-aspect-ratio", params.aspectRatio || "");
+        mapValue("bizyair-resolution", params.resolution || "");
+
+        const randomSeedEl = document.getElementById("bizyair-random-seed");
+        if (randomSeedEl) randomSeedEl.checked = !!params.randomSeed;
+    }
+
+    function buildTemplateOptionsHtml(selectedId) {
+        const templates = getAllTemplates();
+        const baseIds = Object.keys(BASE_TEMPLATES);
+        const customIds = Object.keys(customTemplates).filter(id => !BASE_TEMPLATES[id]);
+        const orderedIds = [...baseIds, ...customIds];
+        return orderedIds.map(id => {
+            const t = templates[id];
+            const selected = id === selectedId ? "selected" : "";
+            const label = t ? t.label : id;
+            return `<option value="${id}" ${selected}>${label}</option>`;
+        }).join("");
+    }
+
+    function refreshTemplateSelect() {
+        const select = document.getElementById("bizyair-template");
+        if (!select) return;
+        select.innerHTML = buildTemplateOptionsHtml(bizyairTemplate);
+    }
+
+    function renderCustomTemplateList() {
+        const container = document.getElementById("bizyair-custom-templates");
+        if (!container) return;
+
+        if (!customTemplateDefs || customTemplateDefs.length === 0) {
+            container.innerHTML = `<div style="color:#777;font-size:12px;">暂无自定义模板</div>`;
+            return;
+        }
+
+        const items = customTemplateDefs.map(def => {
+            const label = escapeHtml(def.label || def.id || "未命名模板");
+            const id = escapeHtml(def.id || "");
+            const webAppId = escapeHtml(def.webAppId || def.web_app_id || "");
+            return `
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 10px;background:#23232a;border-radius:6px;margin-bottom:8px;">
+                    <div style="min-width:0;">
+                        <div style="font-size:12px;color:#ddd;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${label}</div>
+                        <div style="font-size:11px;color:#777;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">ID: ${id} | web_app_id: ${webAppId}</div>
+                    </div>
+                    <button type="button" class="bizyair-btn" style="background:#ef4444;color:white;padding:6px 10px;font-size:12px;flex:0 0 auto;" onclick="window.deleteBizyairCustomTemplate('${id}')">删除</button>
+                </div>
+            `;
+        }).join("");
+
+        container.innerHTML = items;
+    }
+
+    function isNumericValue(value) {
+        if (typeof value === "number") return Number.isFinite(value);
+        if (typeof value === "string") {
+            const trimmed = value.trim();
+            if (!trimmed) return false;
+            return Number.isFinite(Number(trimmed));
+        }
+        return false;
+    }
+
+    function detectPromptKeys(inputValues) {
+        const entries = Object.entries(inputValues || {}).filter(([, value]) => typeof value === "string");
+        if (entries.length === 0) return { positiveKey: null, negativeKey: null };
+
+        const promptCandidates = entries.filter(([key]) => /(prompt|text|value)/i.test(key));
+        const candidates = promptCandidates.length ? promptCandidates : entries;
+
+        const negativeHints = [
+            "blurry", "low quality", "worst quality", "watermark", "text", "logo", "jpeg", "ugly", "bad",
+            "模糊", "低质量", "水印", "文字", "噪点", "低分辨率", "丑"
+        ];
+
+        let negativeKey = null;
+        let bestScore = 0;
+
+        for (const [key, value] of candidates) {
+            const keyLower = key.toLowerCase();
+            if (keyLower.includes("negative") || keyLower.includes("neg")) {
+                negativeKey = key;
+                bestScore = 999;
+                break;
+            }
+
+            const valueLower = value.toLowerCase();
+            let score = 0;
+            negativeHints.forEach(hint => {
+                if (valueLower.includes(hint)) score += 1;
+            });
+
+            if (score > bestScore) {
+                bestScore = score;
+                negativeKey = key;
+            }
+        }
+
+        if (bestScore === 0) {
+            negativeKey = null;
+        }
+
+        let positiveKey = candidates.find(([key]) => key !== negativeKey)?.[0] || candidates[0][0];
+        if (positiveKey === negativeKey) negativeKey = null;
+
+        return { positiveKey, negativeKey };
+    }
+
+    function detectParamKeys(inputValues) {
+        const keys = Object.keys(inputValues || {});
+        const map = {};
+
+        const pickKey = (suffixes, requireNumeric) => {
+            for (const key of keys) {
+                const lower = key.toLowerCase();
+                if (suffixes.some(suffix => lower.endsWith(suffix))) {
+                    if (!requireNumeric || isNumericValue(inputValues[key])) {
+                        return key;
+                    }
+                }
+            }
+            return null;
+        };
+
+        map.width = pickKey([".width", "custom_width", "_width", "width"], true);
+        map.height = pickKey([".height", "custom_height", "_height", "height"], true);
+        map.steps = pickKey([".steps", "_steps", "steps"], true);
+        map.seed = pickKey([".seed", "_seed", "seed"], true);
+        map.cfg = pickKey([".cfg", "_cfg", "cfg"], true);
+        map.sampler = pickKey([".sampler_name", "sampler_name"], false);
+        map.scheduler = pickKey([".scheduler", "scheduler"], false);
+        map.denoise = pickKey([".denoise", "denoise"], true);
+        map.scaleBy = pickKey([".scale_by", "scale_by", "scaleby", "scaleBy"], true);
+        map.aspectRatio = pickKey([".aspect_ratio", "aspect_ratio"], false);
+        map.resolution = pickKey([".resolution", "resolution"], false);
+
+        if (!map.width || !map.height) {
+            const valueKeys = keys.filter(key =>
+                key.toLowerCase().endsWith(".value") && isNumericValue(inputValues[key])
+            );
+            const hasFlux = keys.some(key => key.toLowerCase().includes("flux"));
+            if (hasFlux && valueKeys.length >= 2) {
+                map.width = map.width || valueKeys[0];
+                map.height = map.height || valueKeys[1];
+            }
+        }
+
+        return Object.fromEntries(Object.entries(map).filter(([, value]) => value));
+    }
+
+    function buildDefaultParamsFromInput(inputValues, paramKeyMap, promptKeys) {
+        const defaults = {
+            positivePrompt: promptKeys.positiveKey && typeof inputValues[promptKeys.positiveKey] === "string"
+                ? inputValues[promptKeys.positiveKey]
+                : "",
+            negativePrompt: promptKeys.negativeKey && typeof inputValues[promptKeys.negativeKey] === "string"
+                ? inputValues[promptKeys.negativeKey]
+                : "",
+            width: 832,
+            height: 1216,
+            steps: 20,
+            seed: 101,
+            cfg: 7,
+            sampler: "euler",
+            scaleBy: 1,
+            randomSeed: true,
+            scheduler: "simple",
+            denoise: 1,
+            aspectRatio: "",
+            resolution: ""
+        };
+
+        const assignNumber = (field, key) => {
+            if (!key) return;
+            const value = inputValues[key];
+            if (isNumericValue(value)) {
+                defaults[field] = Number(value);
+            }
+        };
+
+        assignNumber("width", paramKeyMap.width);
+        assignNumber("height", paramKeyMap.height);
+        assignNumber("steps", paramKeyMap.steps);
+        assignNumber("seed", paramKeyMap.seed);
+        assignNumber("cfg", paramKeyMap.cfg);
+        assignNumber("scaleBy", paramKeyMap.scaleBy);
+        assignNumber("denoise", paramKeyMap.denoise);
+
+        if (paramKeyMap.sampler && inputValues[paramKeyMap.sampler]) {
+            defaults.sampler = inputValues[paramKeyMap.sampler];
+        }
+        if (paramKeyMap.scheduler && inputValues[paramKeyMap.scheduler]) {
+            defaults.scheduler = inputValues[paramKeyMap.scheduler];
+        }
+        if (paramKeyMap.aspectRatio && inputValues[paramKeyMap.aspectRatio]) {
+            defaults.aspectRatio = inputValues[paramKeyMap.aspectRatio];
+        }
+        if (paramKeyMap.resolution && inputValues[paramKeyMap.resolution]) {
+            defaults.resolution = inputValues[paramKeyMap.resolution];
+        }
+
+        return defaults;
+    }
+
+    function escapeHtml(value) {
+        return String(value)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+    }
+
+    function findMatchingBrace(text, startIndex) {
+        let depth = 0;
+        let inString = false;
+        let stringChar = "";
+        let escape = false;
+
+        for (let i = startIndex; i < text.length; i++) {
+            const ch = text[i];
+
+            if (inString) {
+                if (escape) {
+                    escape = false;
+                } else if (ch === "\\") {
+                    escape = true;
+                } else if (ch === stringChar) {
+                    inString = false;
+                    stringChar = "";
+                }
+                continue;
+            }
+
+            if (ch === "\"" || ch === "'") {
+                inString = true;
+                stringChar = ch;
+                continue;
+            }
+
+            if (ch === "{") depth += 1;
+            if (ch === "}") {
+                depth -= 1;
+                if (depth === 0) return i;
+            }
+        }
+
+        return -1;
+    }
+
+    function sanitizeJsonText(text) {
+        return text.replace(/,(\s*[}\]])/g, "$1");
+    }
+
+    function tryParseJson(text) {
+        if (!text) return null;
+        const trimmed = text.trim();
+        try {
+            return JSON.parse(trimmed);
+        } catch (_) {}
+
+        try {
+            return JSON.parse(sanitizeJsonText(trimmed));
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function extractJsonObjects(rawText) {
+        const results = [];
+        const marker = "JSON.stringify";
+        let index = 0;
+
+        while ((index = rawText.indexOf(marker, index)) !== -1) {
+            const braceStart = rawText.indexOf("{", index);
+            if (braceStart === -1) break;
+            const braceEnd = findMatchingBrace(rawText, braceStart);
+            if (braceEnd === -1) break;
+
+            const jsonText = rawText.slice(braceStart, braceEnd + 1);
+            const parsed = tryParseJson(jsonText);
+            if (parsed) results.push(parsed);
+
+            index = braceEnd + 1;
+        }
+
+        if (results.length === 0) {
+            const parsed = tryParseJson(rawText);
+            if (parsed) results.push(parsed);
+        }
+
+        return results;
+    }
+
+    function buildCustomTemplateDef(payload, label, index, total, positiveKeyOverride, negativeKeyOverride) {
+        if (!payload || !payload.web_app_id || !payload.input_values) return null;
+
+        const inputValues = payload.input_values;
+        const promptKeys = detectPromptKeys(inputValues);
+        const effectivePositiveKey = positiveKeyOverride || promptKeys.positiveKey;
+        const effectiveNegativeKey = negativeKeyOverride || promptKeys.negativeKey;
+        if (!effectivePositiveKey) return null;
+
+        const paramKeyMap = detectParamKeys(inputValues);
+        const defaultParams = buildDefaultParamsFromInput(inputValues, paramKeyMap, {
+            positiveKey: effectivePositiveKey,
+            negativeKey: effectiveNegativeKey
+        });
+        const safeLabel = label
+            ? (total > 1 ? `${label} ${index + 1}` : label)
+            : `自定义模板 ${payload.web_app_id}`;
+        const id = `custom_${payload.web_app_id}_${Date.now()}_${index}`;
+
+        const parsedWebAppId = parseInt(payload.web_app_id, 10);
+        const webAppId = Number.isFinite(parsedWebAppId) ? parsedWebAppId : payload.web_app_id;
+
+        return {
+            id,
+            label: safeLabel,
+            webAppId,
+            outputIndexFromEnd: 1,
+            positivePromptKey: effectivePositiveKey,
+            negativePromptKey: effectiveNegativeKey || null,
+            baseInput: deepClone(inputValues),
+            paramKeyMap,
+            defaultParams,
+            suppressPreviewOutput: true
+        };
+    }
+
+    let pendingImportPayloads = [];
+    let pendingImportLabel = "";
+
+    function buildImportReview(payloads, label) {
+        const reviewEl = document.getElementById("bizyair-import-review");
+        if (!reviewEl) return;
+
+        const items = payloads.map((payload, idx) => {
+            const inputValues = payload.input_values || {};
+            const stringEntries = Object.entries(inputValues)
+                .filter(([, value]) => typeof value === "string")
+                .map(([key, value]) => ({
+                    key,
+                    value
+                }));
+
+            const promptKeys = detectPromptKeys(inputValues);
+            const positiveKey = promptKeys.positiveKey || "";
+            const negativeKey = promptKeys.negativeKey || "";
+
+            const options = stringEntries.length === 0
+                ? `<option value="">(无可选字段)</option>`
+                : stringEntries.map(({ key, value }) => {
+                    const preview = value.length > 80 ? value.slice(0, 80) + "..." : value;
+                    return `<option value="${escapeHtml(key)}">${escapeHtml(key)} | ${escapeHtml(preview)}</option>`;
+                }).join("");
+
+            const allEntries = Object.entries(inputValues || {});
+            const nodeList = allEntries.map(([key, value]) => {
+                const raw = typeof value === "string" ? value : JSON.stringify(value);
+                const preview = raw.length > 120 ? raw.slice(0, 120) + "..." : raw;
+                return `<div style="font-size:11px;color:#777;word-break:break-all;"><span style="color:#9aa4b2;">${escapeHtml(key)}</span> = ${escapeHtml(preview)}</div>`;
+            }).join("") || `<div style="font-size:11px;color:#777;">未找到可用的节点</div>`;
+
+            return `
+                <div style="margin-bottom:12px;padding:10px;background:#23232a;border-radius:6px;">
+                    <div style="font-size:12px;color:#aaa;margin-bottom:8px;">模板 ${idx + 1} | web_app_id: ${escapeHtml(payload.web_app_id)}</div>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px;">
+                        <div>
+                            <label style="color:#aaa;font-size:11px;">正面提示词字段</label>
+                            <select id="bizyair-import-pos-${idx}" class="bizyair-input">
+                                ${options}
+                            </select>
+                        </div>
+                        <div>
+                            <label style="color:#aaa;font-size:11px;">负面提示词字段（可选）</label>
+                            <select id="bizyair-import-neg-${idx}" class="bizyair-input">
+                                <option value="">(无)</option>
+                                ${options}
+                            </select>
+                        </div>
+                    </div>
+                    <details>
+                        <summary style="cursor:pointer;color:#888;font-size:11px;">查看所有文本节点</summary>
+                        <div style="margin-top:6px;">${nodeList}</div>
+                    </details>
+                </div>
+            `;
+        }).join("");
+
+        reviewEl.innerHTML = items || `<div style="color:#777;font-size:12px;">未识别到可用模板。</div>`;
+
+        payloads.forEach((payload, idx) => {
+            const inputValues = payload.input_values || {};
+            const promptKeys = detectPromptKeys(inputValues);
+            const posSelect = document.getElementById(`bizyair-import-pos-${idx}`);
+            const negSelect = document.getElementById(`bizyair-import-neg-${idx}`);
+            if (posSelect && promptKeys.positiveKey) posSelect.value = promptKeys.positiveKey;
+            if (negSelect && promptKeys.negativeKey) negSelect.value = promptKeys.negativeKey;
+        });
+    }
+
+    window.parseBizyairTemplate = function() {
+        const labelInput = document.getElementById("bizyair-import-label");
+        const rawInput = document.getElementById("bizyair-import-raw");
+        const hint = document.getElementById("bizyair-import-hint");
+        const confirmBtn = document.getElementById("bizyair-import-confirm");
+        const reviewEl = document.getElementById("bizyair-import-review");
+        const label = labelInput ? labelInput.value.trim() : "";
+        const rawText = rawInput ? rawInput.value : "";
+
+        if (!label) {
+            showToast("请先填写模板名称");
+            return;
+        }
+        if (!rawText || !rawText.trim()) {
+            showToast("请先粘贴模板文本");
+            return;
+        }
+
+        const payloads = extractJsonObjects(rawText);
+        if (payloads.length === 0) {
+            showToast("未识别到可用的模板内容");
+            return;
+        }
+
+        payloads.forEach(payload => {
+            if (payload && Object.prototype.hasOwnProperty.call(payload, "suppress_preview_output")) {
+                payload.suppress_preview_output = true;
+            }
+        });
+
+        pendingImportPayloads = payloads;
+        pendingImportLabel = label;
+
+        buildImportReview(payloads, label);
+        if (hint) {
+            hint.textContent = `已解析 ${payloads.length} 个模板，请选择正负面字段后确认导入`;
+        }
+        if (confirmBtn) confirmBtn.disabled = false;
+        showToast(`✅ 已解析 ${payloads.length} 个模板`);
+    };
+
+    window.confirmBizyairImport = function() {
+        const hint = document.getElementById("bizyair-import-hint");
+        if (!pendingImportPayloads || pendingImportPayloads.length === 0) {
+            showToast("请先解析模板");
+            return;
+        }
+
+        const newDefs = [];
+        for (let idx = 0; idx < pendingImportPayloads.length; idx++) {
+            const payload = pendingImportPayloads[idx];
+            const posSelect = document.getElementById(`bizyair-import-pos-${idx}`);
+            const negSelect = document.getElementById(`bizyair-import-neg-${idx}`);
+            const positiveKey = posSelect ? posSelect.value : "";
+            const negativeKey = negSelect ? negSelect.value : "";
+
+            if (!positiveKey) {
+                showToast(`模板 ${idx + 1} 未选择正面提示词字段`);
+                return;
+            }
+
+            const def = buildCustomTemplateDef(payload, pendingImportLabel, idx, pendingImportPayloads.length, positiveKey, negativeKey || null);
+            if (def) newDefs.push(def);
+        }
+
+        if (newDefs.length === 0) {
+            showToast("模板导入失败");
+            return;
+        }
+
+        const updatedDefs = [...customTemplateDefs, ...newDefs];
+        saveCustomTemplateDefs(updatedDefs);
+        refreshCustomTemplates();
+        refreshTemplateSelect();
+        renderCustomTemplateList();
+
+        pendingImportPayloads = [];
+        pendingImportLabel = "";
+        if (confirmBtn) confirmBtn.disabled = true;
+        if (reviewEl) reviewEl.innerHTML = "";
+
+        if (hint) {
+            hint.textContent = `已导入 ${newDefs.length} 个模板`;
+        }
+
+        showToast(`✅ 已导入 ${newDefs.length} 个模板`);
+        window.switchBizyairTemplate(newDefs[0].id);
+    };
+
+    let slotSelection = loadSlotSelection();
+    let bizyairTemplate = normalizeTemplateId(localStorage.getItem("bizyair_template"));
     let bizyairApiKey = localStorage.getItem("bizyair_api_key") || "";
-    let bizyairWebAppId = localStorage.getItem("bizyair_web_app_id") || "44306";
+    let bizyairWebAppId = getWebAppIdForTemplate(bizyairTemplate);
     let autoGenEnabled = localStorage.getItem("bizyair_auto_gen") === "true";
     let tempLocators = {};
     let messageObserver = null;
     let galleryData = [];
     const isTouchDevice = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
-    
-    let imageParams = JSON.parse(localStorage.getItem("bizyair_params") || JSON.stringify({
-        positivePrompt: "",
-        negativePrompt: "blurry, noisy, messy, lowres, jpeg, artifacts, ill, distorted, malformed, text, watermark, signature, username, artist name, logo",
-        width: 832,
-        height: 1216,
-        steps: 20,
-        seed: 101,
-        cfg: 8,
-        sampler: "euler_ancestral",
-        scaleBy: 1.2,
-        randomSeed: false
-    }));
 
-    const defaultParams = {
-        "93:CLIPTextEncode.text": "",
-        "55:CLIPTextEncode.text": imageParams.negativePrompt,
-        "47:EmptyLatentImage.width": parseInt(imageParams.width),
-        "47:EmptyLatentImage.height": parseInt(imageParams.height),
-        "47:EmptyLatentImage.batch_size": 1,
-        "89:FaceDetailer.steps": parseInt(imageParams.steps),
-        "89:FaceDetailer.seed": parseInt(imageParams.seed),
-        "89:FaceDetailer.cfg": parseFloat(imageParams.cfg),
-        "89:FaceDetailer.sampler_name": imageParams.sampler,
-        "89:FaceDetailer.scheduler": imageParams.scheduler,
-        "74:LatentUpscaleBy.scale_by": 1.5
-    };
+    let imageParams = loadTemplateParams(bizyairTemplate);
 
     function injectStyles() {
         const styleId = "bizyair-plugin-style";
@@ -235,10 +1057,14 @@
     }
 
     function createSettingsModal() {
-        if (document.getElementById("bizyair-settings-modal")) return;
-        
-        const style = document.createElement("style");
-        style.textContent = `
+        const existingModal = document.getElementById("bizyair-settings-modal");
+        if (existingModal) existingModal.remove();
+
+        const styleId = "bizyair-settings-modal-style";
+        if (!document.getElementById(styleId)) {
+            const style = document.createElement("style");
+            style.id = styleId;
+            style.textContent = `
             @media screen and (max-width: 768px) {
                 #bizyair-settings-modal .bizyair-modal-content { width: 100vw !important; height: 100vh !important; max-width: 100vw !important; max-height: 100vh !important; border-radius: 0 !important; }
                 #bizyair-settings-modal .bizyair-tabs { flex-wrap: wrap; }
@@ -246,8 +1072,11 @@
                 #bizyair-settings-modal .bizyair-view { padding: 10px; }
                 #bizyair-settings-modal .bizyair-input, #bizyair-settings-modal select { font-size: 16px; padding: 12px; }
             }
-        `;
-        document.head.appendChild(style);
+            `;
+            document.head.appendChild(style);
+        }
+
+        const templateOptions = buildTemplateOptionsHtml(bizyairTemplate);
         
         const div = document.createElement("div");
         div.id = "bizyair-settings-modal";
@@ -267,9 +1096,14 @@
                     <div style="margin-bottom:15px;padding:10px;background:#2a2a2a;border-radius:4px;">
                         <label style="display:block; margin-bottom:5px; color:#aaa; font-size:12px;">API Key</label>
                         <input type="text" id="bizyair-api-key" class="bizyair-input" value="${bizyairApiKey}" placeholder="输入你的 API Key">
+
+                        <label style="display:block; margin-bottom:5px; color:#aaa; font-size:12px;">生图模板</label>
+                        <select id="bizyair-template" class="bizyair-input" onchange="window.switchBizyairTemplate(this.value)">
+                            ${templateOptions}
+                        </select>
                         
                         <label style="display:block; margin-bottom:5px; color:#aaa; font-size:12px;">Web App ID</label>
-                        <input type="text" id="bizyair-web-app-id" class="bizyair-input" value="${bizyairWebAppId}" placeholder="默认: 44306">
+                        <input type="text" id="bizyair-web-app-id" class="bizyair-input" value="${bizyairWebAppId}" placeholder="默认: ${getTemplateDef(bizyairTemplate).defaultWebAppId}">
                     </div>
                     
                     <div style="margin: 15px 0; padding: 10px; background: #2a2a2a; border-radius: 4px;">
@@ -322,7 +1156,7 @@
                     
                     <div style="margin-top:10px;">
                         <label style="color:#aaa;font-size:11px;">正面提示词</label>
-                        <textarea id="bizyair-pos-prompt" class="bizyair-input" rows="2" style="margin-bottom:0;"></textarea>
+                        <textarea id="bizyair-pos-prompt" class="bizyair-input" rows="2" style="margin-bottom:0;">${imageParams.positivePrompt || ""}</textarea>
                     </div>
                     
                     <div style="margin-top:10px;">
@@ -336,8 +1170,50 @@
                             <span style="color:#ddd; font-size:13px;">每次生图随机种子</span>
                         </label>
                     </div>
+
+                    <div style="margin-top:10px;">
+                        <button type="button" class="bizyair-btn bizyair-btn-secondary" style="width:100%;" onclick="window.toggleBizyairAdvanced()">⚙️ 高级参数</button>
+                    </div>
+                    <div id="bizyair-advanced-panel" style="display:none;margin-top:10px;">
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+                            <div>
+                                <label style="color:#aaa;font-size:11px;">Scheduler</label>
+                                <input type="text" id="bizyair-scheduler" class="bizyair-input" value="${imageParams.scheduler || ''}" style="margin-bottom:0;">
+                            </div>
+                            <div>
+                                <label style="color:#aaa;font-size:11px;">Denoise</label>
+                                <input type="number" step="0.01" id="bizyair-denoise" class="bizyair-input" value="${imageParams.denoise !== undefined ? imageParams.denoise : ''}" style="margin-bottom:0;">
+                            </div>
+                            <div>
+                                <label style="color:#aaa;font-size:11px;">Aspect Ratio</label>
+                                <input type="text" id="bizyair-aspect-ratio" class="bizyair-input" value="${imageParams.aspectRatio || ''}" style="margin-bottom:0;">
+                            </div>
+                            <div>
+                                <label style="color:#aaa;font-size:11px;">Resolution</label>
+                                <input type="text" id="bizyair-resolution" class="bizyair-input" value="${imageParams.resolution || ''}" style="margin-bottom:0;">
+                            </div>
+                        </div>
+                    </div>
                     
                     <button class="bizyair-btn bizyair-btn-primary" style="width:100%;margin-top:10px;" onclick="window.saveBizyairSettings()">💾 保存设置</button>
+                    <div id="bizyair-save-hint" style="margin-top:6px;color:#777;font-size:12px;"></div>
+
+                    <h3 style="color:#a855f7;margin:20px 0 10px;font-size:14px;">📥 模板导入</h3>
+                    <div style="margin-bottom:10px;padding:10px;background:#2a2a2a;border-radius:4px;">
+                        <label style="display:block; margin-bottom:5px; color:#aaa; font-size:12px;">模板名称</label>
+                        <input type="text" id="bizyair-import-label" class="bizyair-input" placeholder="例如：我的模板">
+
+                        <label style="display:block; margin:10px 0 5px; color:#aaa; font-size:12px;">原始 API 文本</label>
+                        <textarea id="bizyair-import-raw" class="bizyair-input" rows="6" placeholder="粘贴原样的 API 示例代码"></textarea>
+
+                        <button type="button" class="bizyair-btn bizyair-btn-secondary" style="width:100%;margin-top:10px;" onclick="window.parseBizyairTemplate()">🔎 解析模板</button>
+                        <button type="button" id="bizyair-import-confirm" class="bizyair-btn bizyair-btn-primary" style="width:100%;margin-top:10px;" onclick="window.confirmBizyairImport()" disabled>✅ 确认导入</button>
+                        <div id="bizyair-import-hint" style="margin-top:8px;color:#777;font-size:12px;">支持粘贴多个示例，解析后可选择正负面字段。</div>
+                        <div id="bizyair-import-review" style="margin-top:10px;"></div>
+                    </div>
+
+                    <h3 style="color:#a855f7;margin:20px 0 10px;font-size:14px;">🗂️ 自定义模板管理</h3>
+                    <div id="bizyair-custom-templates"></div>
                 </div>
                 
                 <div id="bizyair-view-gallery" class="bizyair-view" style="display:none;padding:15px;overflow-y:auto;max-height:calc(90vh - 100px);">
@@ -357,6 +1233,10 @@
             </div>
         `;
         document.body.appendChild(div);
+
+        applyParamsToUI(imageParams);
+        renderCustomTemplateList();
+        updateGalleryCount();
         
         window.switchBizyairTab = function(tab) {
             document.querySelectorAll('.bizyair-tab').forEach(t => {
@@ -385,18 +1265,66 @@
         showToast(checked ? "⚡ 自动生图已开启" : "⏸️ 自动生图已关闭");
     };
 
+    window.switchBizyairTemplate = function(templateId) {
+        if (!getAllTemplates()[templateId]) return;
+        bizyairTemplate = templateId;
+        localStorage.setItem("bizyair_template", templateId);
+        bizyairWebAppId = getWebAppIdForTemplate(templateId);
+        imageParams = loadTemplateParams(templateId);
+
+        const templateSelect = document.getElementById("bizyair-template");
+        if (templateSelect) templateSelect.value = templateId;
+
+        const webAppInput = document.getElementById("bizyair-web-app-id");
+        if (webAppInput) {
+            webAppInput.value = bizyairWebAppId;
+            webAppInput.placeholder = `默认: ${getTemplateDef(templateId).defaultWebAppId}`;
+        }
+
+        applyParamsToUI(imageParams);
+        showToast(`✅ 已切换模板：${getTemplateDef(templateId).label}`);
+    };
+
     window.toggleRandomSeed = function(checked) {
         imageParams.randomSeed = checked;
-        localStorage.setItem("bizyair_params", JSON.stringify(imageParams));
+        saveTemplateParams(bizyairTemplate, imageParams);
         showToast(checked ? "🎲 已启用随机种子" : "🔒 已关闭随机种子");
     };
 
+    window.deleteBizyairCustomTemplate = function(templateId) {
+        if (!templateId) return;
+        if (!confirm("确定删除这个自定义模板？")) return;
+
+        const nextDefs = (customTemplateDefs || []).filter(def => def && def.id !== templateId);
+        saveCustomTemplateDefs(nextDefs);
+        refreshCustomTemplates();
+        refreshTemplateSelect();
+        renderCustomTemplateList();
+
+        if (bizyairTemplate === templateId) {
+            window.switchBizyairTemplate("legacy");
+        }
+
+        showToast("🗑️ 已删除自定义模板");
+    };
+
+    window.toggleBizyairAdvanced = function() {
+        const panel = document.getElementById("bizyair-advanced-panel");
+        if (!panel) return;
+        panel.style.display = panel.style.display === "none" || panel.style.display === "" ? "block" : "none";
+    };
+
     window.saveBizyairSettings = function() {
+        const templateSelect = document.getElementById("bizyair-template");
+        bizyairTemplate = templateSelect ? normalizeTemplateId(templateSelect.value) : bizyairTemplate;
+        localStorage.setItem("bizyair_template", bizyairTemplate);
+
         bizyairApiKey = document.getElementById("bizyair-api-key").value.trim();
-        bizyairWebAppId = document.getElementById("bizyair-web-app-id").value.trim() || "44306";
+        const defaultWebAppId = getTemplateDef(bizyairTemplate).defaultWebAppId;
+        bizyairWebAppId = document.getElementById("bizyair-web-app-id").value.trim() || String(defaultWebAppId);
         localStorage.setItem("bizyair_api_key", bizyairApiKey);
-        localStorage.setItem("bizyair_web_app_id", bizyairWebAppId);
-        
+        setWebAppIdForTemplate(bizyairTemplate, bizyairWebAppId);
+
         imageParams = {
             positivePrompt: document.getElementById("bizyair-pos-prompt").value,
             negativePrompt: document.getElementById("bizyair-neg-prompt").value,
@@ -407,12 +1335,18 @@
             cfg: document.getElementById("bizyair-cfg").value,
             scaleBy: document.getElementById("bizyair-scale").value,
             sampler: document.getElementById("bizyair-sampler").value,
-            randomSeed: document.getElementById("bizyair-random-seed").checked
+            randomSeed: document.getElementById("bizyair-random-seed").checked,
+            scheduler: document.getElementById("bizyair-scheduler").value.trim(),
+            denoise: document.getElementById("bizyair-denoise").value,
+            aspectRatio: document.getElementById("bizyair-aspect-ratio").value.trim(),
+            resolution: document.getElementById("bizyair-resolution").value.trim()
         };
-        localStorage.setItem("bizyair_params", JSON.stringify(imageParams));
+        saveTemplateParams(bizyairTemplate, imageParams);
         
         document.getElementById("bizyair-settings-modal").classList.remove("show");
         showToast("✅ 设置已保存");
+        const saveHint = document.getElementById("bizyair-save-hint");
+        if (saveHint) saveHint.textContent = "✅ 设置已保存";
     };
 
     function checkSidebarButton() {
@@ -539,27 +1473,140 @@
         return true;
     }
 
-    function getSlotIdFromTag(description, occurrenceKey) {
-        const raw = `${description}::${occurrenceKey}`;
+    function getMessageStableKey(messageEl, messageIndex) {
+        const container = messageEl.closest('[mesid]');
+        if (container) {
+            const mesid = container.getAttribute('mesid');
+            if (mesid !== null && mesid !== "") {
+                return `mesid_${mesid}`;
+            }
+        }
+        const dataId = messageEl.getAttribute('data-message-id') || messageEl.getAttribute('data-mesid');
+        if (dataId) return `msg_${dataId}`;
+        return `idx_${messageIndex}`;
+    }
+
+    function hashText(text) {
         let hash = 2166136261;
-        for (let i = 0; i < raw.length; i++) {
-            hash ^= raw.charCodeAt(i);
+        for (let i = 0; i < text.length; i++) {
+            hash ^= text.charCodeAt(i);
             hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
         }
-        const stableHash = (hash >>> 0).toString(36);
+        return (hash >>> 0).toString(36);
+    }
+
+    function getSlotIdFromTag(description, messageKey, tagOrdinal) {
+        const raw = `${messageKey}::${tagOrdinal}::${description}`;
+        const stableHash = hashText(raw);
+        const safeKey = `${messageKey}_${tagOrdinal}`.replace(/[^a-zA-Z0-9]/g, '');
+        return `slot_${safeKey}_${stableHash}`;
+    }
+
+    function getLegacySlotIdFromTag(description, occurrenceKey) {
+        const raw = `${description}::${occurrenceKey}`;
+        const stableHash = hashText(raw);
         const safeKey = occurrenceKey.replace(/[^a-zA-Z0-9]/g, '');
         return `slot_${safeKey}_${stableHash}`;
     }
 
+    function migrateGallerySlotId(item, newSlotId) {
+        if (!item || item.slotId === newSlotId) return;
+        const updated = { ...item, slotId: newSlotId };
+        upsertGalleryItem(updated, updated.persisted);
+        if (updated.persisted) {
+            persistItemToDb(updated).catch((e) => {
+                console.warn("更新图片 slotId 失败:", e);
+            });
+        }
+    }
+
+    function loadSlotSelection() {
+        try {
+            return JSON.parse(localStorage.getItem(SLOT_SELECTION_KEY) || "{}");
+        } catch (e) {
+            console.warn("读取图片选择状态失败:", e);
+            return {};
+        }
+    }
+
+    function saveSlotSelection() {
+        localStorage.setItem(SLOT_SELECTION_KEY, JSON.stringify(slotSelection));
+    }
+
+    function setSlotSelection(slotId, itemId) {
+        if (!slotId) return;
+        if (itemId) {
+            slotSelection[slotId] = itemId;
+        } else {
+            delete slotSelection[slotId];
+        }
+        saveSlotSelection();
+    }
+
+    function getSlotVersions(slotId) {
+        return galleryData.filter(item => item && item.slotId === slotId);
+    }
+
+    function getLatestSlotItem(slotId) {
+        const versions = getSlotVersions(slotId);
+        if (versions.length === 0) return null;
+        return versions.slice().sort((a, b) => b.timestamp - a.timestamp)[0];
+    }
+
     function getSavedGalleryItem(slotId) {
-        return galleryData.find(item => item && (item.slotId === slotId || item.id === slotId)) || null;
+        if (!slotId) return null;
+        const selectedId = slotSelection[slotId];
+        if (selectedId) {
+            const selected = galleryData.find(item => item && item.id === selectedId);
+            if (selected) return selected;
+        }
+
+        const latest = getLatestSlotItem(slotId);
+        if (latest) {
+            setSlotSelection(slotId, latest.id);
+            return latest;
+        }
+
+        return null;
+    }
+
+    function normalizeSlotSelections() {
+        let changed = false;
+        Object.keys(slotSelection).forEach(slotId => {
+            const selectedId = slotSelection[slotId];
+            const selected = galleryData.find(item => item && item.id === selectedId);
+            if (selected) return;
+            const latest = getLatestSlotItem(slotId);
+            if (latest) {
+                slotSelection[slotId] = latest.id;
+                changed = true;
+            } else {
+                delete slotSelection[slotId];
+                changed = true;
+            }
+        });
+        if (changed) saveSlotSelection();
     }
 
     function persistGalleryCache(stripUrls) {
         const cached = stripUrls
-            ? galleryData.map(item => ({ ...item, url: "" }))
+            ? galleryData.map(item => {
+                if (!item) return item;
+                if (item.persisted) return { ...item, url: "" };
+                return item;
+            })
             : galleryData;
-        localStorage.setItem("bizyair_gallery", JSON.stringify(cached));
+        try {
+            localStorage.setItem("bizyair_gallery", JSON.stringify(cached));
+        } catch (e) {
+            console.warn("写入本地缓存失败，尝试精简缓存:", e);
+            try {
+                const minimal = galleryData.map(item => item ? { ...item, url: "" } : item);
+                localStorage.setItem("bizyair_gallery", JSON.stringify(minimal));
+            } catch (e2) {
+                console.warn("精简缓存写入失败:", e2);
+            }
+        }
     }
 
     function isGalleryViewVisible() {
@@ -575,15 +1622,16 @@
     }
 
     function upsertGalleryItem(item, stripUrls) {
+        const normalizedItem = { ...item, persisted: !!item.persisted };
         const existingIdx = galleryData.findIndex(galleryItem =>
-            galleryItem && (galleryItem.id === item.id || (item.slotId && galleryItem.slotId === item.slotId))
+            galleryItem && galleryItem.id === normalizedItem.id
         );
 
         if (existingIdx !== -1) {
             galleryData.splice(existingIdx, 1);
         }
 
-        galleryData.unshift(item);
+        galleryData.unshift(normalizedItem);
         persistGalleryCache(stripUrls);
         refreshGalleryUi();
     }
@@ -616,7 +1664,7 @@
             } else {
                 clickTimer = setTimeout(function() {
                     clickTimer = null;
-                    window.bizyairOpenGallery(img.src);
+                    window.bizyairOpenGallery(img.src, slotId);
                 }, 500);
             }
         };
@@ -687,20 +1735,32 @@
                     fullMatch,
                     description,
                     index: match.index,
-                    length: fullMatch.length
+                    length: fullMatch.length,
+                    order: matches.length + 1
                 });
             }
+
+            const messageKey = getMessageStableKey(messageEl, messageIndex);
 
             for (let i = matches.length - 1; i >= 0; i--) {
                 const current = matches[i];
                 const occurrenceKey = `${messageIndex}-${current.index}-${current.length}`;
-                const tagKey = `${current.fullMatch}@${occurrenceKey}`;
+                const tagOrdinal = current.order;
+                const tagKey = `${messageKey}::${tagOrdinal}::${current.fullMatch}`;
 
                 if (processedTags.has(tagKey)) continue;
 
-                const slotId = getSlotIdFromTag(current.description, occurrenceKey);
+                const slotId = getSlotIdFromTag(current.description, messageKey, tagOrdinal);
+                const legacySlotId = getLegacySlotIdFromTag(current.description, occurrenceKey);
                 const existingWrapper = messageEl.querySelector(`.bizyair-inject-wrapper[data-slot-id="${slotId}"]`);
-                const savedItem = getSavedGalleryItem(slotId);
+                let savedItem = getSavedGalleryItem(slotId);
+                if (!savedItem && legacySlotId) {
+                    const legacyItem = getSavedGalleryItem(legacySlotId);
+                    if (legacyItem) {
+                        savedItem = legacyItem;
+                        migrateGallerySlotId(legacyItem, slotId);
+                    }
+                }
 
                 if (existingWrapper) {
                     if (savedItem) {
@@ -759,13 +1819,15 @@
     async function autoGenerateImage(slotId, description) {
         const btn = document.querySelector(`button[data-slot-id="${slotId}"]`);
         if (!btn) return;
+
+        const templateId = bizyairTemplate;
         
         try {
-            const result = await generateImage(description);
+            const result = await generateImage(description, templateId);
             console.log("BizyAir result:", result);
             
             if (result && result.outputs && Array.isArray(result.outputs) && result.outputs.length > 0) {
-                const imageUrl = getFinalImage(result.outputs);
+                const imageUrl = getFinalImage(result.outputs, templateId);
                 if (imageUrl) {
                     showImageResult(slotId, imageUrl);
                 } else {
@@ -773,7 +1835,7 @@
                 }
             } else if (result && result.request_id) {
                 btn.innerHTML = `<span>⏳</span> 等待图片...`;
-                await pollForResult(result.request_id, slotId);
+                await pollForResult(result.request_id, slotId, templateId);
             } else {
                 console.log("BizyAir response:", result);
                 throw new Error("未获取到图片地址");
@@ -826,49 +1888,93 @@
             };
         });
     }
+
+    async function requestPersistentStorage() {
+        try {
+            if (navigator.storage && navigator.storage.persist) {
+                const granted = await navigator.storage.persist();
+                console.log(granted ? "已申请持久化存储" : "未授予持久化存储");
+            }
+        } catch (e) {
+            console.warn("申请持久化存储失败:", e);
+        }
+    }
+
+    function blobToDataUrl(blob) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result);
+            reader.onerror = () => reject(reader.error || new Error("读取图片失败"));
+            reader.readAsDataURL(blob);
+        });
+    }
+
+    async function persistItemToDb(item) {
+        if (!db) await initDB();
+        if (!db) throw new Error("数据库不可用");
+
+        return new Promise((resolve, reject) => {
+            const transaction = db.transaction([STORE_NAME], 'readwrite');
+            const store = transaction.objectStore(STORE_NAME);
+            store.put(item);
+            transaction.oncomplete = () => resolve();
+            transaction.onerror = () => reject(transaction.error);
+            transaction.onabort = () => reject(transaction.error || new Error("数据库事务中止"));
+        });
+    }
     
     async function saveToGallery(url, prompt, slotId) {
-        const itemId = slotId || 'gal_' + Date.now();
+        const uniqueSuffix = Math.random().toString(36).slice(2, 8);
+        const itemId = slotId
+            ? `${slotId}_${Date.now()}_${uniqueSuffix}`
+            : `gal_${Date.now()}_${uniqueSuffix}`;
         const previewItem = {
             id: itemId,
             slotId: slotId,
             url: url,
             prompt: prompt,
-            timestamp: Date.now()
+            timestamp: Date.now(),
+            persisted: false
         };
+
+        if (slotId) {
+            setSlotSelection(slotId, itemId);
+        }
 
         upsertGalleryItem(previewItem, false);
 
         try {
-            const response = await fetch(url);
+            const response = await fetch(url, { mode: 'cors' });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
             const blob = await response.blob();
-            const reader = new FileReader();
-            reader.onloadend = async function() {
-                const base64 = reader.result;
-                const item = {
-                    id: itemId,
-                    slotId: slotId,
-                    url: base64,
-                    prompt: prompt,
-                    timestamp: previewItem.timestamp
-                };
-                
-                try {
-                    if (!db) await initDB();
-                    if (db) {
-                        const transaction = db.transaction([STORE_NAME], 'readwrite');
-                        const store = transaction.objectStore(STORE_NAME);
-                        store.put(item);
-                    }
-                    upsertGalleryItem(item, true);
-                } catch (dbError) {
-                    console.error("保存到数据库失败:", dbError);
-                    upsertGalleryItem(item, false);
-                }
+            const base64 = await blobToDataUrl(blob);
+            const item = {
+                id: itemId,
+                slotId: slotId,
+                url: base64,
+                prompt: prompt,
+                timestamp: previewItem.timestamp,
+                persisted: false
             };
-            reader.readAsDataURL(blob);
+
+            // 先把 base64 写入内存/本地缓存，避免 URL 过期
+            upsertGalleryItem(item, false);
+
+            if (slotId) {
+                setSlotSelection(slotId, itemId);
+            }
+
+            try {
+                await persistItemToDb(item);
+                upsertGalleryItem({ ...item, persisted: true }, true);
+            } catch (dbError) {
+                console.error("保存到数据库失败:", dbError);
+                showToast("⚠️ 本地持久化失败，已保留临时缓存");
+                upsertGalleryItem(item, false);
+            }
         } catch (e) {
             console.error("保存图片失败:", e);
+            showToast("⚠️ 保存图片失败，可能是链接已过期");
         }
     }
     
@@ -890,15 +1996,19 @@
                 request.onsuccess = () => {
                     const items = request.result;
                     if (items && items.length > 0) {
-                        galleryData = items.sort((a, b) => b.timestamp - a.timestamp);
+                        galleryData = items
+                            .map(item => ({ ...item, persisted: true }))
+                            .sort((a, b) => b.timestamp - a.timestamp);
                     } else {
                         galleryData = loadGalleryFromLocalCache();
                     }
+                    normalizeSlotSelections();
                     refreshGalleryUi();
                     resolve();
                 };
                 request.onerror = () => {
                     galleryData = loadGalleryFromLocalCache();
+                    normalizeSlotSelections();
                     refreshGalleryUi();
                     resolve();
                 };
@@ -906,14 +2016,16 @@
         }
 
         galleryData = loadGalleryFromLocalCache();
+        normalizeSlotSelections();
         refreshGalleryUi();
     }
 
     function loadGalleryFromLocalCache() {
         try {
             const cached = JSON.parse(localStorage.getItem("bizyair_gallery") || "[]");
-            return cached
+        return cached
                 .filter(item => item && item.url)
+                .map(item => ({ ...item, persisted: false }))
                 .sort((a, b) => b.timestamp - a.timestamp);
         } catch (e) {
             console.error("读取本地画廊缓存失败:", e);
@@ -925,11 +2037,17 @@
         const modal = document.getElementById("bizyair-settings-modal");
         if (modal) {
             const tab = modal.querySelector('.bizyair-tab[data-tab="gallery"]');
-            if (tab) tab.innerHTML = `🖼️ 画廊 (${galleryData.length})`;
+            if (tab) {
+                const total = galleryData.length;
+                const cached = galleryData.filter(item =>
+                    item && (item.persisted || (typeof item.url === "string" && item.url.startsWith("data:")))
+                ).length;
+                tab.innerHTML = `🖼️ 画廊 (${total} | 缓存 ${cached})`;
+            }
         }
     }
 
-    async function pollForResult(taskId, slotId) {
+    async function pollForResult(taskId, slotId, templateId) {
         const btn = document.querySelector(`button[data-slot-id="${slotId}"]`);
         const maxAttempts = 60;
         let attempts = 0;
@@ -948,7 +2066,7 @@
                 console.log("Poll response:", data);
                 
                 if (data.status === 'Success' && data.outputs && Array.isArray(data.outputs) && data.outputs.length > 0) {
-                    const imageUrl = getFinalImage(data.outputs);
+                    const imageUrl = getFinalImage(data.outputs, templateId);
                     if (!imageUrl) continue;
                     showImageResult(slotId, imageUrl);
                     return;
@@ -969,39 +2087,49 @@
         showToast("⏱️ 等待超时");
     }
 
-    function getCurrentParams() {
-        const stored = JSON.parse(localStorage.getItem("bizyair_params") || JSON.stringify(imageParams));
+    function getStoredParams(templateId) {
+        return loadTemplateParams(templateId || bizyairTemplate);
+    }
+
+    function getCurrentParams(stored, templateId) {
         const seedValue = stored.randomSeed
             ? Math.floor(Math.random() * 1000000000000000)
             : parseInt(stored.seed);
 
-        return {
-            "27:KSampler.seed": seedValue,
-            "27:KSampler.steps": parseInt(stored.steps),
-            "27:KSampler.sampler_name": stored.sampler,
-            "61:CM_SDXLExtendedResolution.resolution": `${stored.width}x${stored.height}`,
-            "69:DF_Latent_Scale_by_ratio.modifier": parseFloat(stored.scaleBy),
-            "31:CLIPTextEncode.text": stored.positivePrompt,
-            "32:CLIPTextEncode.text": stored.negativePrompt,
-            "54:EmptyLatentImage.batch_size": 1,
-            "57:dynamicThresholdingFull.mimic_scale": parseFloat(stored.cfg)
-        };
+        const template = getTemplateDef(templateId || bizyairTemplate);
+        return template.buildParams(stored, seedValue);
     }
 
-    function getFinalImage(outputs) {
+    function getFinalImage(outputs, templateId) {
         if (!outputs || !Array.isArray(outputs) || outputs.length === 0) return null;
-        if (outputs.length === 1) return outputs[0].object_url;
-        
-        const lastIndex = outputs.length - 2;
-        if (lastIndex < 0) return outputs[outputs.length - 1].object_url;
-        
-        return outputs[lastIndex].object_url;
+        const template = getTemplateDef(templateId || bizyairTemplate);
+        const fromEnd = template.outputIndexFromEnd || 1;
+        const index = outputs.length - fromEnd;
+        const safeIndex = index >= 0 ? index : outputs.length - 1;
+        return outputs[safeIndex].object_url;
     }
 
-    async function generateImage(description) {
-        const params = getCurrentParams();
-        const stored = JSON.parse(localStorage.getItem("bizyair_params") || JSON.stringify(imageParams));
-        params["31:CLIPTextEncode.text"] = (stored.positivePrompt || "") + (description ? ", " + description : "");
+    async function generateImage(description, templateId) {
+        const activeTemplate = normalizeTemplateId(templateId || bizyairTemplate);
+        const stored = getStoredParams(activeTemplate);
+        const params = getCurrentParams(stored, activeTemplate);
+        const template = getTemplateDef(activeTemplate);
+        const positiveKey = template.positivePromptKey;
+        const negativeKey = template.negativePromptKey;
+        const suppressPreviewOutput = template.suppressPreviewOutput !== undefined ? template.suppressPreviewOutput : true;
+
+        if (positiveKey) {
+            params[positiveKey] = (stored.positivePrompt || "") + (description ? ", " + description : "");
+        }
+        if (negativeKey) {
+            params[negativeKey] = stored.negativePrompt || "";
+        }
+
+        const templateWebAppId = getWebAppIdForTemplate(activeTemplate);
+        const parsedWebAppId = parseInt(templateWebAppId, 10);
+        const webAppId = Number.isFinite(parsedWebAppId)
+            ? parsedWebAppId
+            : getTemplateDef(activeTemplate).defaultWebAppId;
         
         const response = await fetch('https://api.bizyair.cn/w/v1/webapp/task/openapi/create', {
             method: 'POST',
@@ -1010,8 +2138,8 @@
                 'Authorization': `Bearer ${bizyairApiKey}`
             },
             body: JSON.stringify({
-                web_app_id: parseInt(bizyairWebAppId),
-                suppress_preview_output: false,
+                web_app_id: webAppId,
+                suppress_preview_output: suppressPreviewOutput,
                 input_values: params
             })
         });
@@ -1025,7 +2153,7 @@
         return result;
     }
 
-    window.bizyairOpenGallery = function(url) {
+    window.bizyairOpenGallery = function(url, slotId) {
         const gallery = document.createElement("div");
         gallery.id = "bizyair-gallery";
         gallery.style.cssText = `
@@ -1041,8 +2169,59 @@
             justify-content: center;
             cursor: pointer;
         `;
-        gallery.innerHTML = `<img src="${url}" style="max-width:95%;max-height:95%;object-fit:contain;">`;
-        gallery.onclick = () => gallery.remove();
+
+        const versions = slotId ? getSlotVersions(slotId).slice().sort((a, b) => b.timestamp - a.timestamp) : [];
+        let currentIndex = 0;
+        if (versions.length > 0) {
+            const selectedId = slotSelection[slotId];
+            const selectedIdx = selectedId ? versions.findIndex(v => v.id === selectedId) : -1;
+            if (selectedIdx >= 0) {
+                currentIndex = selectedIdx;
+            } else {
+                const byUrl = versions.findIndex(v => v.url === url);
+                currentIndex = byUrl >= 0 ? byUrl : 0;
+            }
+        }
+
+        const img = document.createElement("img");
+        img.style.cssText = "max-width:95%;max-height:95%;object-fit:contain;";
+        img.src = versions.length > 0 ? versions[currentIndex].url : url;
+
+        const badge = document.createElement("div");
+        badge.style.cssText = "position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.6);color:#fff;padding:6px 10px;border-radius:12px;font-size:12px;";
+        badge.textContent = versions.length > 1 ? `第 ${currentIndex + 1} / ${versions.length} 张（点击图片切换）` : "点击空白关闭";
+
+        img.onclick = (e) => {
+            e.stopPropagation();
+            if (versions.length <= 1) return;
+            currentIndex = (currentIndex + 1) % versions.length;
+            img.src = versions[currentIndex].url;
+            badge.textContent = `第 ${currentIndex + 1} / ${versions.length} 张（点击图片切换）`;
+        };
+
+        const closeGallery = () => {
+            gallery.remove();
+            if (slotId && versions.length > 0) {
+                const chosen = versions[currentIndex];
+                if (chosen) {
+                    setSlotSelection(slotId, chosen.id);
+                    syncSavedImagesToWrappers();
+                }
+            }
+            document.removeEventListener("keydown", escHandler);
+        };
+
+        const escHandler = (event) => {
+            if (event.key === "Escape") {
+                closeGallery();
+            }
+        };
+
+        document.addEventListener("keydown", escHandler);
+        gallery.onclick = closeGallery;
+
+        gallery.appendChild(img);
+        gallery.appendChild(badge);
         document.body.appendChild(gallery);
     };
 
@@ -1136,6 +2315,7 @@
         
         const sortedIdx = Array.from(gallerySelected).sort((a, b) => b - a);
         
+        const removedItems = [];
         if (db) {
             const transaction = db.transaction([STORE_NAME], 'readwrite');
             const store = transaction.objectStore(STORE_NAME);
@@ -1144,14 +2324,28 @@
                 if (item && item.id) {
                     store.delete(item.id);
                 }
+                if (item) removedItems.push(item);
             });
         }
         
         sortedIdx.forEach(idx => {
+            if (!removedItems.length) {
+                const item = galleryData[idx];
+                if (item) removedItems.push(item);
+            }
             galleryData.splice(idx, 1);
         });
         
         localStorage.setItem("bizyair_gallery", JSON.stringify(galleryData));
+        removedItems.forEach(item => {
+            if (item && item.slotId) {
+                const selectedId = slotSelection[item.slotId];
+                if (selectedId === item.id) {
+                    const latest = getLatestSlotItem(item.slotId);
+                    setSlotSelection(item.slotId, latest ? latest.id : null);
+                }
+            }
+        });
         
         gallerySelected.clear();
         galleryEditMode = false;
@@ -1175,7 +2369,7 @@
     window.openBizyairImage = function(idx) {
         const item = galleryData[idx];
         if (!item) return;
-        window.bizyairOpenGallery(item.url);
+        window.bizyairOpenGallery(item.url, item.slotId || null);
     }
 
     function sleep(ms) {
@@ -1271,6 +2465,13 @@
         
         galleryData.splice(idx, 1);
         localStorage.setItem("bizyair_gallery", JSON.stringify(galleryData));
+        if (item && item.slotId) {
+            const selectedId = slotSelection[item.slotId];
+            if (selectedId === item.id) {
+                const latest = getLatestSlotItem(item.slotId);
+                setSlotSelection(item.slotId, latest ? latest.id : null);
+            }
+        }
         refreshGalleryUi();
     }
     
@@ -1300,6 +2501,8 @@
         
         galleryData = [];
         localStorage.setItem("bizyair_gallery", JSON.stringify(galleryData));
+        slotSelection = {};
+        saveSlotSelection();
         refreshGalleryUi();
         showToast("🗑️ 画廊已清空");
     }
@@ -1308,6 +2511,8 @@
         injectStyles();
         createToast();
         createSettingsModal();
+
+        requestPersistentStorage();
         
         initDB().then(() => {
             loadGalleryFromDB().then(() => {
