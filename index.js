@@ -22,6 +22,7 @@
             id: "legacy",
             label: "二次元简单生图 (44306)",
             defaultWebAppId: 44306,
+            hasSeedControl: true,
             outputIndexFromEnd: 1,
             positivePromptKey: "31:CLIPTextEncode.text",
             negativePromptKey: "32:CLIPTextEncode.text",
@@ -57,6 +58,7 @@
             id: "face_detailer",
             label: "二次元精修生图 (47362)",
             defaultWebAppId: 47362,
+            hasSeedControl: true,
             outputIndexFromEnd: 1,
             positivePromptKey: "93:CLIPTextEncode.text",
             negativePromptKey: "55:CLIPTextEncode.text",
@@ -82,6 +84,8 @@
                 "47:EmptyLatentImage.width": parseInt(stored.width),
                 "47:EmptyLatentImage.height": parseInt(stored.height),
                 "47:EmptyLatentImage.batch_size": 1,
+                // Some 47362 workflow variants still use a KSampler seed as the base latent source.
+                "27:KSampler.seed": seedValue,
                 "89:FaceDetailer.steps": parseInt(stored.steps),
                 "89:FaceDetailer.seed": seedValue,
                 "89:FaceDetailer.cfg": parseFloat(stored.cfg),
@@ -94,6 +98,7 @@
             id: "zimage",
             label: "zimage生图 (48570)",
             defaultWebAppId: 48570,
+            hasSeedControl: true,
             outputIndexFromEnd: 1,
             positivePromptKey: "6:CLIPTextEncode.text",
             negativePromptKey: "7:CLIPTextEncode.text",
@@ -131,6 +136,7 @@
             id: "flux",
             label: "flux生图 (44324)",
             defaultWebAppId: 44324,
+            hasSeedControl: false,
             outputIndexFromEnd: 1,
             positivePromptKey: "76:PrimitiveStringMultiline.value",
             negativePromptKey: null,
@@ -197,6 +203,7 @@
             id: def.id,
             label: def.label || def.id,
             defaultWebAppId: def.webAppId,
+            hasSeedControl: !!paramKeyMap.seed,
             outputIndexFromEnd: def.outputIndexFromEnd || 1,
             positivePromptKey: def.positivePromptKey || null,
             negativePromptKey: def.negativePromptKey || null,
@@ -270,6 +277,27 @@
 
     function getTemplateDef(templateId) {
         return getAllTemplates()[normalizeTemplateId(templateId)];
+    }
+
+    function templateSupportsSeed(templateId) {
+        const template = getTemplateDef(templateId);
+        if (!template) return false;
+        return template.hasSeedControl !== false;
+    }
+
+    function normalizeRandomSeedValue(value) {
+        if (typeof value === "boolean") return value;
+        if (typeof value === "string") {
+            const normalized = value.trim().toLowerCase();
+            if (normalized === "true") return true;
+            if (normalized === "false") return false;
+        }
+        return !!value;
+    }
+
+    function normalizeSeedValue(value, fallback = 101) {
+        const parsed = parseInt(value, 10);
+        return Number.isFinite(parsed) ? parsed : fallback;
     }
 
     function getWebAppIdStorageKey(templateId) {
@@ -371,7 +399,32 @@
         mapValue("bizyair-resolution", params.resolution || "");
 
         const randomSeedEl = document.getElementById("bizyair-random-seed");
-        if (randomSeedEl) randomSeedEl.checked = !!params.randomSeed;
+        if (randomSeedEl) randomSeedEl.checked = normalizeRandomSeedValue(params.randomSeed);
+    }
+
+    function updateSeedControls(templateId, currentParams) {
+        const supportsSeed = templateSupportsSeed(templateId);
+        const seedInput = document.getElementById("bizyair-seed");
+        const randomSeedEl = document.getElementById("bizyair-random-seed");
+        const seedHint = document.getElementById("bizyair-seed-hint");
+
+        if (seedInput) {
+            seedInput.disabled = !supportsSeed;
+            seedInput.style.opacity = supportsSeed ? "1" : "0.6";
+        }
+
+        if (randomSeedEl) {
+            randomSeedEl.disabled = !supportsSeed;
+            if (!supportsSeed) randomSeedEl.checked = false;
+        }
+
+        if (!supportsSeed && currentParams) {
+            currentParams.randomSeed = false;
+        }
+
+        if (seedHint) {
+            seedHint.textContent = supportsSeed ? "" : "当前模板不支持 Seed，随机种子不会生效";
+        }
     }
 
     function buildTemplateOptionsHtml(selectedId) {
@@ -865,7 +918,12 @@
     let autoGenEnabled = localStorage.getItem("bizyair_auto_gen") === "true";
     let tempLocators = {};
     let messageObserver = null;
+    let scanHeartbeatTimer = null;
     let galleryData = [];
+    const generatingSlots = new Set();
+    const slotAbortControllers = new Map();
+    const autoGenScheduledSlots = new Set();
+    const autoGenTriggeredSlots = new Set();
     const isTouchDevice = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
 
     let imageParams = loadTemplateParams(bizyairTemplate);
@@ -1169,6 +1227,7 @@
                             <input type="checkbox" id="bizyair-random-seed" ${imageParams.randomSeed ? 'checked' : ''} onchange="window.toggleRandomSeed(this.checked)">
                             <span style="color:#ddd; font-size:13px;">每次生图随机种子</span>
                         </label>
+                        <div id="bizyair-seed-hint" style="margin-top:6px;color:#f59e0b;font-size:12px;"></div>
                     </div>
 
                     <div style="margin-top:10px;">
@@ -1235,6 +1294,7 @@
         document.body.appendChild(div);
 
         applyParamsToUI(imageParams);
+        updateSeedControls(bizyairTemplate, imageParams);
         renderCustomTemplateList();
         updateGalleryCount();
         
@@ -1282,10 +1342,19 @@
         }
 
         applyParamsToUI(imageParams);
+        updateSeedControls(templateId, imageParams);
         showToast(`✅ 已切换模板：${getTemplateDef(templateId).label}`);
     };
 
     window.toggleRandomSeed = function(checked) {
+        if (!templateSupportsSeed(bizyairTemplate)) {
+            const randomSeedEl = document.getElementById("bizyair-random-seed");
+            if (randomSeedEl) randomSeedEl.checked = false;
+            imageParams.randomSeed = false;
+            saveTemplateParams(bizyairTemplate, imageParams);
+            showToast("⚠️ 当前模板不支持 Seed");
+            return;
+        }
         imageParams.randomSeed = checked;
         saveTemplateParams(bizyairTemplate, imageParams);
         showToast(checked ? "🎲 已启用随机种子" : "🔒 已关闭随机种子");
@@ -1335,12 +1404,16 @@
             cfg: document.getElementById("bizyair-cfg").value,
             scaleBy: document.getElementById("bizyair-scale").value,
             sampler: document.getElementById("bizyair-sampler").value,
-            randomSeed: document.getElementById("bizyair-random-seed").checked,
+            randomSeed: templateSupportsSeed(bizyairTemplate)
+                ? document.getElementById("bizyair-random-seed").checked
+                : false,
             scheduler: document.getElementById("bizyair-scheduler").value.trim(),
             denoise: document.getElementById("bizyair-denoise").value,
             aspectRatio: document.getElementById("bizyair-aspect-ratio").value.trim(),
             resolution: document.getElementById("bizyair-resolution").value.trim()
         };
+
+        updateSeedControls(bizyairTemplate, imageParams);
         saveTemplateParams(bizyairTemplate, imageParams);
         
         document.getElementById("bizyair-settings-modal").classList.remove("show");
@@ -1637,14 +1710,52 @@
     }
 
     function renderGenerateButton(wrapper, slotId, description, loadingText) {
+        const isGenerating = generatingSlots.has(slotId);
+        const effectiveLoadingText = loadingText || (isGenerating ? "生成中..." : "");
         const encodedDescription = encodeURIComponent(description);
+        const clickAction = isGenerating
+            ? `window.bizyairCancelGenerate('${slotId}', this)`
+            : `window.bizyairStartGenerate('${slotId}', this)`;
+        const icon = isGenerating ? '⏹️' : (effectiveLoadingText ? '⏳' : '🖼️');
         wrapper.className = "bizyair-inject-wrapper";
         wrapper.setAttribute("data-slot-id", slotId);
         wrapper.innerHTML = `
-            <button class="bizyair-inject-btn${loadingText ? ' loading' : ''}" data-description="${encodedDescription}" data-slot-id="${slotId}" onclick="window.bizyairStartGenerate('${slotId}', this)">
-                <span>${loadingText ? '⏳' : '🖼️'}</span> ${loadingText || '生成图片'}
+            <button class="bizyair-inject-btn${effectiveLoadingText ? ' loading' : ''}" data-description="${encodedDescription}" data-slot-id="${slotId}" onclick="${clickAction}">
+                <span>${icon}</span> ${effectiveLoadingText || '生成图片'}
             </button>
         `;
+    }
+
+    function isAbortError(error) {
+        return !!error && (error.name === "AbortError" || String(error.message || "").includes("aborted"));
+    }
+
+    function delayWithAbort(ms, signal) {
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                cleanup();
+                resolve();
+            }, ms);
+
+            const onAbort = () => {
+                cleanup();
+                reject(new DOMException("Aborted", "AbortError"));
+            };
+
+            const cleanup = () => {
+                clearTimeout(timer);
+                if (signal) signal.removeEventListener("abort", onAbort);
+            };
+
+            if (signal) {
+                if (signal.aborted) {
+                    cleanup();
+                    reject(new DOMException("Aborted", "AbortError"));
+                    return;
+                }
+                signal.addEventListener("abort", onAbort, { once: true });
+            }
+        });
     }
 
     function bindResultImageEvents(resultWrapper) {
@@ -1771,6 +1882,8 @@
                         if (!currentImg || currentImg.src !== savedItem.url) {
                             renderImageResult(existingWrapper, slotId, current.description, savedItem.url);
                         }
+                    } else if (generatingSlots.has(slotId)) {
+                        renderGenerateButton(existingWrapper, slotId, current.description, "生成中...");
                     }
                     processedTags.add(tagKey);
                     continue;
@@ -1782,6 +1895,8 @@
 
                 if (savedItem) {
                     renderImageResult(wrapper, slotId, current.description, savedItem.url);
+                } else if (generatingSlots.has(slotId)) {
+                    renderGenerateButton(wrapper, slotId, current.description, "生成中...");
                 } else {
                     renderGenerateButton(wrapper, slotId, current.description);
                 }
@@ -1791,39 +1906,87 @@
 
                 processedTags.add(tagKey);
 
-                if (autoGenEnabled && !savedItem) {
-                    setTimeout(() => window.bizyairStartGenerate(slotId), 300);
+                if (autoGenEnabled && !savedItem && !generatingSlots.has(slotId) && !autoGenScheduledSlots.has(slotId) && !autoGenTriggeredSlots.has(slotId)) {
+                    autoGenScheduledSlots.add(slotId);
+                    autoGenTriggeredSlots.add(slotId);
+                    setTimeout(() => {
+                        autoGenScheduledSlots.delete(slotId);
+                        if (!autoGenEnabled || generatingSlots.has(slotId) || getSavedGalleryItem(slotId)) return;
+                        const autoBtn = document.querySelector(`button[data-slot-id="${slotId}"]`);
+                        if (!autoBtn) {
+                            autoGenTriggeredSlots.delete(slotId);
+                            return;
+                        }
+                        window.bizyairStartGenerate(slotId, autoBtn);
+                    }, 300);
                 }
             }
         });
     }
 
+    function shouldRunScanForMutations(mutations) {
+        for (const mutation of mutations) {
+            const target = mutation.target;
+            if (target instanceof Element) {
+                if (target.matches('.mes_text') || target.closest('.mes_text')) {
+                    return true;
+                }
+            }
+
+            for (const node of mutation.addedNodes) {
+                if (!(node instanceof Element)) continue;
+                if (node.matches('.mes_text') || node.querySelector('.mes_text')) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     window.bizyairStartGenerate = function(slotId, explicitBtn) {
         const btn = explicitBtn || document.querySelector(`button[data-slot-id="${slotId}"]`);
         if (!btn) return;
+
+        if (generatingSlots.has(slotId)) {
+            window.bizyairCancelGenerate(slotId, btn);
+            return;
+        }
+
+        autoGenScheduledSlots.delete(slotId);
+        generatingSlots.add(slotId);
+        const controller = new AbortController();
+        slotAbortControllers.set(slotId, controller);
         
-        const description = decodeURIComponent(btn.dataset.description);
+        const description = btn.dataset.description ? decodeURIComponent(btn.dataset.description) : "";
+        const wrapper = btn.closest('.bizyair-inject-wrapper');
+        if (wrapper) {
+            renderGenerateButton(wrapper, slotId, description, "生成中...（点击取消）");
+        }
         
-        btn.innerHTML = `<span>⏳</span> 生成中...`;
-        btn.classList.add("loading");
-        btn.onclick = function() {
-            btn.innerHTML = `<span>🖼️</span> 生成图片`;
-            btn.classList.remove("loading");
-            btn.onclick = function() { window.bizyairStartGenerate(slotId, btn); };
-            showToast("⏹️ 已取消生成");
-        };
-        
-        autoGenerateImage(slotId, description);
+        autoGenerateImage(slotId, description, controller.signal);
     }
 
-    async function autoGenerateImage(slotId, description) {
-        const btn = document.querySelector(`button[data-slot-id="${slotId}"]`);
-        if (!btn) return;
+    window.bizyairCancelGenerate = function(slotId, explicitBtn) {
+        const controller = slotAbortControllers.get(slotId);
+        if (controller && !controller.signal.aborted) {
+            controller.abort();
+        }
 
+        const btn = explicitBtn || document.querySelector(`button[data-slot-id="${slotId}"]`);
+        if (btn) {
+            btn.innerHTML = `<span>⏹️</span> 已取消`;
+            btn.classList.remove("loading");
+        }
+
+        showToast("⏹️ 已取消生成");
+    }
+
+    async function autoGenerateImage(slotId, description, signal) {
         const templateId = bizyairTemplate;
+        let wasCancelled = false;
         
         try {
-            const result = await generateImage(description, templateId);
+            const result = await generateImage(description, templateId, signal);
             console.log("BizyAir result:", result);
             
             if (result && result.outputs && Array.isArray(result.outputs) && result.outputs.length > 0) {
@@ -1834,17 +1997,39 @@
                     throw new Error("无法获取图片地址");
                 }
             } else if (result && result.request_id) {
-                btn.innerHTML = `<span>⏳</span> 等待图片...`;
-                await pollForResult(result.request_id, slotId, templateId);
+                const wrapper = document.querySelector(`.bizyair-inject-wrapper[data-slot-id="${slotId}"]`);
+                if (wrapper) {
+                    renderGenerateButton(wrapper, slotId, description, "等待图片...（点击取消）");
+                }
+                await pollForResult(result.request_id, slotId, templateId, signal, description);
             } else {
                 console.log("BizyAir response:", result);
                 throw new Error("未获取到图片地址");
             }
         } catch (error) {
+            if (isAbortError(error)) {
+                wasCancelled = true;
+            }
             console.error("BizyAir Error:", error);
-            btn.innerHTML = `<span>❌</span> 生成失败`;
-            btn.classList.remove("loading");
-            showToast("❌ 生成失败: " + error.message);
+            if (!wasCancelled) {
+                const btn = document.querySelector(`button[data-slot-id="${slotId}"]`);
+                if (btn) {
+                    btn.innerHTML = `<span>❌</span> 生成失败`;
+                    btn.classList.remove("loading");
+                }
+                showToast("❌ 生成失败: " + error.message);
+            }
+        } finally {
+            slotAbortControllers.delete(slotId);
+            generatingSlots.delete(slotId);
+            autoGenScheduledSlots.delete(slotId);
+
+            if (wasCancelled) {
+                const wrapper = document.querySelector(`.bizyair-inject-wrapper[data-slot-id="${slotId}"]`);
+                if (wrapper) {
+                    renderGenerateButton(wrapper, slotId, description);
+                }
+            }
         }
     }
 
@@ -2047,19 +2232,20 @@
         }
     }
 
-    async function pollForResult(taskId, slotId, templateId) {
+    async function pollForResult(taskId, slotId, templateId, signal, description) {
         const btn = document.querySelector(`button[data-slot-id="${slotId}"]`);
         const maxAttempts = 60;
         let attempts = 0;
         
         while (attempts < maxAttempts) {
-            await new Promise(resolve => setTimeout(resolve, 2000));
+            await delayWithAbort(2000, signal);
             
             try {
                 const res = await fetch(`https://api.bizyair.cn/w/v1/webapp/task/openapi/query?task_id=${taskId}`, {
                     headers: {
                         'Authorization': `Bearer ${bizyairApiKey}`
-                    }
+                    },
+                    signal
                 });
                 const data = await res.json();
                 
@@ -2074,6 +2260,7 @@
                     throw new Error(data.error || "生成失败");
                 }
             } catch (e) {
+                if (isAbortError(e)) throw e;
                 console.error("Polling error:", e);
             }
             
@@ -2091,13 +2278,38 @@
         return loadTemplateParams(templateId || bizyairTemplate);
     }
 
-    function getCurrentParams(stored, templateId) {
-        const seedValue = stored.randomSeed
-            ? Math.floor(Math.random() * 1000000000000000)
-            : parseInt(stored.seed);
+    function syncGeneratedSeed(templateId, seedValue) {
+        const normalized = normalizeTemplateId(templateId || bizyairTemplate);
+        if (!templateSupportsSeed(normalized)) return;
 
-        const template = getTemplateDef(templateId || bizyairTemplate);
-        return template.buildParams(stored, seedValue);
+        if (normalizeTemplateId(bizyairTemplate) === normalized) {
+            imageParams.seed = seedValue;
+            const seedInput = document.getElementById("bizyair-seed");
+            if (seedInput) seedInput.value = String(seedValue);
+        }
+
+        const latest = loadTemplateParams(normalized);
+        latest.seed = seedValue;
+        saveTemplateParams(normalized, latest);
+    }
+
+    function getCurrentParams(stored, templateId) {
+        const activeTemplate = normalizeTemplateId(templateId || bizyairTemplate);
+        const randomSeedEnabled = templateSupportsSeed(activeTemplate)
+            ? normalizeRandomSeedValue(stored.randomSeed)
+            : false;
+        const seedValue = randomSeedEnabled
+            ? Math.floor(Math.random() * 2147483647)
+            : normalizeSeedValue(stored.seed, 101);
+
+        const template = getTemplateDef(activeTemplate);
+        const params = template.buildParams(stored, seedValue);
+        return {
+            params,
+            seedValue,
+            randomSeedEnabled,
+            activeTemplate,
+        };
     }
 
     function getFinalImage(outputs, templateId) {
@@ -2109,17 +2321,31 @@
         return outputs[safeIndex].object_url;
     }
 
-    async function generateImage(description, templateId) {
+    async function generateImage(description, templateId, signal) {
         const activeTemplate = normalizeTemplateId(templateId || bizyairTemplate);
         const stored = getStoredParams(activeTemplate);
-        const params = getCurrentParams(stored, activeTemplate);
+        const built = getCurrentParams(stored, activeTemplate);
+        const params = built.params;
         const template = getTemplateDef(activeTemplate);
         const positiveKey = template.positivePromptKey;
         const negativeKey = template.negativePromptKey;
         const suppressPreviewOutput = template.suppressPreviewOutput !== undefined ? template.suppressPreviewOutput : true;
 
+        if (built.randomSeedEnabled) {
+            syncGeneratedSeed(activeTemplate, built.seedValue);
+            console.info(`[BizyAir] template=${activeTemplate} random seed=${built.seedValue}`);
+        }
+
+        const seedEntries = Object.entries(params).filter(([key]) => /seed/i.test(key));
+        if (seedEntries.length > 0) {
+            console.info("[BizyAir] API seed keys:", Object.fromEntries(seedEntries));
+        }
+
         if (positiveKey) {
-            params[positiveKey] = (stored.positivePrompt || "") + (description ? ", " + description : "");
+            const positiveParts = [stored.positivePrompt, description]
+                .map(value => (typeof value === "string" ? value.trim() : ""))
+                .filter(Boolean);
+            params[positiveKey] = positiveParts.join(", ");
         }
         if (negativeKey) {
             params[negativeKey] = stored.negativePrompt || "";
@@ -2137,6 +2363,7 @@
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${bizyairApiKey}`
             },
+            signal,
             body: JSON.stringify({
                 web_app_id: webAppId,
                 suppress_preview_output: suppressPreviewOutput,
@@ -2239,17 +2466,42 @@
 
     function initObserver() {
         if (messageObserver) return;
-        
-        let scanTimer = null;
+
+        let trailingTimer = null;
+        let lastScanAt = 0;
+        const throttleMs = 80;
+
+        const scheduleScan = () => {
+            const now = Date.now();
+            const elapsed = now - lastScanAt;
+
+            if (elapsed >= throttleMs) {
+                lastScanAt = now;
+                scanAndInjectButtons();
+                return;
+            }
+
+            if (trailingTimer) return;
+            trailingTimer = setTimeout(() => {
+                trailingTimer = null;
+                lastScanAt = Date.now();
+                scanAndInjectButtons();
+            }, throttleMs - elapsed);
+        };
         
         messageObserver = new MutationObserver((mutations) => {
-            if (scanTimer) clearTimeout(scanTimer);
-            scanTimer = setTimeout(() => {
-                scanAndInjectButtons();
-            }, 500);
+            if (!shouldRunScanForMutations(mutations)) return;
+            scheduleScan();
         });
         
         messageObserver.observe(document.body, { childList: true, subtree: true });
+
+        if (!scanHeartbeatTimer) {
+            // Fallback self-healing scan in case some streaming DOM writes bypass observer timing.
+            scanHeartbeatTimer = setInterval(() => {
+                scanAndInjectButtons();
+            }, 500);
+        }
     }
     
     let galleryEditMode = false;
