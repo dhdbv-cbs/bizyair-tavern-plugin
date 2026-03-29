@@ -2094,6 +2094,128 @@
         });
     }
 
+    function createThumbnailFromBlob(blob, maxEdge = 320, quality = 0.72) {
+        return new Promise((resolve, reject) => {
+            const objectUrl = URL.createObjectURL(blob);
+            const img = new Image();
+
+            const cleanup = () => {
+                URL.revokeObjectURL(objectUrl);
+            };
+
+            img.onload = () => {
+                try {
+                    const maxSide = Math.max(img.width, img.height) || 1;
+                    const scale = Math.min(1, maxEdge / maxSide);
+                    const targetWidth = Math.max(1, Math.round(img.width * scale));
+                    const targetHeight = Math.max(1, Math.round(img.height * scale));
+
+                    const canvas = document.createElement("canvas");
+                    canvas.width = targetWidth;
+                    canvas.height = targetHeight;
+
+                    const ctx = canvas.getContext("2d", { alpha: false });
+                    if (!ctx) throw new Error("无法创建缩略图画布");
+
+                    ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+                    const thumbDataUrl = canvas.toDataURL("image/jpeg", quality);
+                    cleanup();
+                    resolve(thumbDataUrl);
+                } catch (e) {
+                    cleanup();
+                    reject(e);
+                }
+            };
+
+            img.onerror = () => {
+                cleanup();
+                reject(new Error("缩略图生成失败"));
+            };
+
+            img.src = objectUrl;
+        });
+    }
+
+    let legacyThumbMigrationRunning = false;
+    let legacyThumbMigrationScheduled = false;
+
+    function hasThumbUrl(item) {
+        return !!(item && typeof item.thumbUrl === "string" && item.thumbUrl.trim());
+    }
+
+    async function backfillLegacyGalleryThumbnails() {
+        if (legacyThumbMigrationRunning) return;
+
+        const targetIds = galleryData
+            .filter(item => item && item.id && item.url && !hasThumbUrl(item))
+            .map(item => item.id);
+
+        if (targetIds.length === 0) return;
+
+        legacyThumbMigrationRunning = true;
+        try {
+            let updatedCount = 0;
+
+            for (let i = 0; i < targetIds.length; i++) {
+                const itemId = targetIds[i];
+                const index = galleryData.findIndex(item => item && item.id === itemId);
+                if (index === -1) continue;
+                const current = galleryData[index];
+                if (!current || !current.url || hasThumbUrl(current)) continue;
+
+                try {
+                    const response = await fetch(current.url, { mode: 'cors' });
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    const blob = await response.blob();
+                    const thumbUrl = await createThumbnailFromBlob(blob);
+
+                    if (!thumbUrl) continue;
+
+                    const updatedItem = { ...current, thumbUrl };
+                    galleryData[index] = updatedItem;
+
+                    if (updatedItem.persisted) {
+                        try {
+                            await persistItemToDb(updatedItem);
+                        } catch (e) {
+                            console.warn("回写旧图缩略图到数据库失败:", e);
+                        }
+                    }
+
+                    updatedCount++;
+
+                    if (updatedCount % 8 === 0) {
+                        persistGalleryCache(true);
+                        if (isGalleryViewVisible()) renderGallery();
+                        await sleep(12);
+                    }
+                } catch (e) {
+                    console.warn("旧图缩略图补齐失败，跳过:", e);
+                }
+            }
+
+            if (updatedCount > 0) {
+                persistGalleryCache(true);
+                refreshGalleryUi();
+                console.log(`[BizyAir] 旧图库缩略图补齐完成: ${updatedCount}/${targetIds.length}`);
+            }
+        } finally {
+            legacyThumbMigrationRunning = false;
+        }
+    }
+
+    function scheduleLegacyThumbBackfill() {
+        if (legacyThumbMigrationScheduled) return;
+        legacyThumbMigrationScheduled = true;
+
+        setTimeout(() => {
+            legacyThumbMigrationScheduled = false;
+            backfillLegacyGalleryThumbnails().catch((e) => {
+                console.warn("旧图库缩略图补齐任务异常:", e);
+            });
+        }, 300);
+    }
+
     async function persistItemToDb(item) {
         if (!db) await initDB();
         if (!db) throw new Error("数据库不可用");
@@ -2117,6 +2239,7 @@
             id: itemId,
             slotId: slotId,
             url: url,
+            thumbUrl: url,
             prompt: prompt,
             timestamp: Date.now(),
             persisted: false
@@ -2133,10 +2256,19 @@
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             const blob = await response.blob();
             const base64 = await blobToDataUrl(blob);
+            let thumbUrl = "";
+
+            try {
+                thumbUrl = await createThumbnailFromBlob(blob);
+            } catch (thumbError) {
+                console.warn("生成缩略图失败，回退使用原图:", thumbError);
+            }
+
             const item = {
                 id: itemId,
                 slotId: slotId,
                 url: base64,
+                thumbUrl: thumbUrl || base64,
                 prompt: prompt,
                 timestamp: previewItem.timestamp,
                 persisted: false
@@ -2189,12 +2321,14 @@
                     }
                     normalizeSlotSelections();
                     refreshGalleryUi();
+                    scheduleLegacyThumbBackfill();
                     resolve();
                 };
                 request.onerror = () => {
                     galleryData = loadGalleryFromLocalCache();
                     normalizeSlotSelections();
                     refreshGalleryUi();
+                    scheduleLegacyThumbBackfill();
                     resolve();
                 };
             });
@@ -2203,6 +2337,7 @@
         galleryData = loadGalleryFromLocalCache();
         normalizeSlotSelections();
         refreshGalleryUi();
+        scheduleLegacyThumbBackfill();
     }
 
     function loadGalleryFromLocalCache() {
@@ -2516,9 +2651,11 @@
             return;
         }
         
-        grid.innerHTML = galleryData.map((item, idx) => `
+        grid.innerHTML = galleryData.map((item, idx) => {
+            const displayUrl = item.thumbUrl || item.url;
+            return `
             <div class="bizyair-gallery-item" style="position:relative;aspect-ratio:1;background:#000;border-radius:8px;overflow:hidden;cursor:pointer;${gallerySelected.has(idx) ? 'border:2px solid #a855f7;' : ''}" onclick="${galleryEditMode ? `window.toggleGallerySelect(${idx})` : `window.openBizyairImage(${idx})`}">
-                <img src="${item.url}" loading="lazy" style="width:100%;height:100%;object-fit:cover;${galleryEditMode ? 'opacity:0.5;' : ''}">
+                <img src="${displayUrl}" loading="lazy" decoding="async" style="width:100%;height:100%;object-fit:cover;${galleryEditMode ? 'opacity:0.5;' : ''}">
                 ${galleryEditMode ? `<div style="position:absolute;top:5px;right:5px;width:24px;height:24px;border-radius:50%;background:${gallerySelected.has(idx) ? '#a855f7' : '#666'};display:flex;align-items:center;justify-content:center;color:white;font-size:14px;">${gallerySelected.has(idx) ? '✓' : ''}</div>` : ''}
                 ${!galleryEditMode ? `
                 <div style="position:absolute;bottom:0;left:0;right:0;background:rgba(0,0,0,0.7);display:flex;justify-content:center;gap:5px;padding:5px;opacity:0;transition:opacity 0.2s;" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0">
@@ -2526,7 +2663,8 @@
                     <button style="background:#ef4444;color:white;padding:4px 8px;font-size:11px;border:none;border-radius:4px;cursor:pointer;" onclick="event.stopPropagation();window.deleteBizyairImage(${idx})">删除</button>
                 </div>` : ''}
             </div>
-        `).join('');
+        `;
+        }).join('');
     }
     
     window.toggleGallerySelect = function(idx) {
