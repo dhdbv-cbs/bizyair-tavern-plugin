@@ -170,9 +170,49 @@
     const TEMPLATE_PARAMS_PREFIX = "bizyair_params_";
     const CUSTOM_TEMPLATES_KEY = "bizyair_custom_templates";
     const SLOT_SELECTION_KEY = "bizyair_slot_selection";
+    const BIZYAIR_LLM_URL_KEY = "bizyair_llm_url";
+    const BIZYAIR_LLM_KEY_KEY = "bizyair_llm_key";
+    const BIZYAIR_LLM_MODEL_KEY = "bizyair_llm_model";
+    const BIZYAIR_PRESET_PREFIX = "bizyair_prompt_";
+    const BIZYAIR_AUTO_TAG_KEY = "bizyair_auto_tag";
+    const BIZYAIR_CONTEXT_KEY = "bizyair_tag_context";
 
     function deepClone(value) {
         return JSON.parse(JSON.stringify(value));
+    }
+
+    function loadPromptPresetList(type) {
+        try {
+            const parsed = JSON.parse(localStorage.getItem(`${BIZYAIR_PRESET_PREFIX}${type}`) || "[]");
+            if (!Array.isArray(parsed)) return [];
+            return parsed.map(item => ({
+                id: item.id || Date.now() + Math.floor(Math.random() * 1000),
+                name: item.name || "未命名",
+                content: item.content || "",
+                active: !!item.active,
+                history: Array.isArray(item.history) ? item.history : []
+            }));
+        } catch (e) {
+            console.warn(`读取 ${type} 预设失败:`, e);
+            return [];
+        }
+    }
+
+    function ensureExclusivePresetState(type, list) {
+        if (type === "char") return list;
+        let foundActive = false;
+        list.forEach(item => {
+            if (!item.active) return;
+            if (!foundActive) {
+                foundActive = true;
+                return;
+            }
+            item.active = false;
+        });
+        if (!foundActive && list[0]) {
+            list[0].active = true;
+        }
+        return list;
     }
 
     function loadCustomTemplateDefs() {
@@ -916,17 +956,157 @@
     let bizyairApiKey = localStorage.getItem("bizyair_api_key") || "";
     let bizyairWebAppId = getWebAppIdForTemplate(bizyairTemplate);
     let autoGenEnabled = localStorage.getItem("bizyair_auto_gen") === "true";
+    let queueLimitEnabled = localStorage.getItem("bizyair_queue_limit") === "true";
+    let autoTagEnabled = localStorage.getItem(BIZYAIR_AUTO_TAG_KEY) === "true";
+    let capturedContext = localStorage.getItem(BIZYAIR_CONTEXT_KEY) || "";
+    let llmSettings = {
+        url: localStorage.getItem(BIZYAIR_LLM_URL_KEY) || "https://api.openai.com/v1",
+        key: localStorage.getItem(BIZYAIR_LLM_KEY_KEY) || "",
+        model: localStorage.getItem(BIZYAIR_LLM_MODEL_KEY) || "gpt-4o-mini"
+    };
+    let promptPresets = {
+        jailbreak: ensureExclusivePresetState("jailbreak", loadPromptPresetList("jailbreak")),
+        task: ensureExclusivePresetState("task", loadPromptPresetList("task")),
+        char: loadPromptPresetList("char")
+    };
+    const presetEditorSelection = {
+        jailbreak: null,
+        task: null,
+        char: null
+    };
     let tempLocators = {};
     let messageObserver = null;
     let scanHeartbeatTimer = null;
+    let restoreObserver = null;
+    let restoreTimer = null;
     let galleryData = [];
     const generatingSlots = new Set();
     const slotAbortControllers = new Map();
     const autoGenScheduledSlots = new Set();
     const autoGenTriggeredSlots = new Set();
+    const queuedGenerationSlots = new Set();
+    const pendingGenerationQueue = [];
     const isTouchDevice = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+    let pendingCharacterBuild = null;
+    const MAX_BACKGROUND_QUEUE_ACTIVE = 2;
+    const QUEUE_DISPATCH_INTERVAL_MS = 1000;
+    let bizyairApiKeys = [];
+    const bizyairKeyPoolState = new Map();
+    const slotAssignedApiKeys = new Map();
+    let queueDispatchTimer = null;
+    let nextQueueDispatchAt = 0;
+    let scheduledQueueDispatch = null;
+    let bizyairCreateDispatchChain = Promise.resolve();
+    let nextBizyairCreateAt = 0;
 
     let imageParams = loadTemplateParams(bizyairTemplate);
+
+    function parseBizyairApiKeys(raw) {
+        return Array.from(new Set(
+            String(raw || "")
+                .replace(/[\r\n，;；]+/g, ",")
+                .split(",")
+                .map(item => item.trim())
+                .filter(Boolean)
+        ));
+    }
+
+    function syncBizyairKeyPool() {
+        bizyairApiKeys = parseBizyairApiKeys(bizyairApiKey);
+
+        const existingKeys = new Set(bizyairApiKeys);
+        Array.from(bizyairKeyPoolState.keys()).forEach(key => {
+            if (!existingKeys.has(key)) {
+                bizyairKeyPoolState.delete(key);
+            }
+        });
+
+        bizyairApiKeys.forEach(key => {
+            if (!bizyairKeyPoolState.has(key)) {
+                bizyairKeyPoolState.set(key, {
+                    key,
+                    inflightCount: 0,
+                    cooldownUntil: 0,
+                    lastAssignedAt: 0,
+                    failureCount: 0
+                });
+            }
+        });
+    }
+
+    function hasMultipleBizyairKeys() {
+        return bizyairApiKeys.length > 1;
+    }
+
+    function shouldUseSingleKeyQueueLimit() {
+        return queueLimitEnabled && bizyairApiKeys.length <= 1;
+    }
+
+    function getBizyairKeyState(key) {
+        if (!key) return null;
+        if (!bizyairKeyPoolState.has(key)) {
+            bizyairKeyPoolState.set(key, {
+                key,
+                inflightCount: 0,
+                cooldownUntil: 0,
+                lastAssignedAt: 0,
+                failureCount: 0
+            });
+        }
+        return bizyairKeyPoolState.get(key);
+    }
+
+    function acquireBizyairApiKeySlot() {
+        const now = Date.now();
+        const candidates = bizyairApiKeys
+            .map(key => getBizyairKeyState(key))
+            .filter(state => state && state.cooldownUntil <= now && state.inflightCount < MAX_BACKGROUND_QUEUE_ACTIVE)
+            .sort((a, b) => {
+                if (a.inflightCount !== b.inflightCount) return a.inflightCount - b.inflightCount;
+                return a.lastAssignedAt - b.lastAssignedAt;
+            });
+
+        const selected = candidates[0] || null;
+        if (!selected) return null;
+
+        selected.inflightCount += 1;
+        selected.lastAssignedAt = now;
+        return selected.key;
+    }
+
+    function releaseBizyairApiKeySlot(key) {
+        const state = getBizyairKeyState(key);
+        if (!state) return;
+        state.inflightCount = Math.max(0, state.inflightCount - 1);
+    }
+
+    function cooldownBizyairApiKey(key, ms = 12000) {
+        const state = getBizyairKeyState(key);
+        if (!state) return;
+        state.cooldownUntil = Date.now() + ms;
+    }
+
+    function getBizyairApiKeyBackoffMs(failureCount) {
+        if (failureCount <= 1) return 60 * 1000;
+        if (failureCount === 2) return 5 * 60 * 1000;
+        return (failureCount * 5) * 60 * 1000;
+    }
+
+    function markBizyairApiKeyFailure(key) {
+        const state = getBizyairKeyState(key);
+        if (!state) return;
+        state.failureCount = (state.failureCount || 0) + 1;
+        state.cooldownUntil = Date.now() + getBizyairApiKeyBackoffMs(state.failureCount);
+    }
+
+    function markBizyairApiKeySuccess(key) {
+        const state = getBizyairKeyState(key);
+        if (!state) return;
+        state.failureCount = 0;
+        state.cooldownUntil = 0;
+    }
+
+    syncBizyairKeyPool();
 
     function injectStyles() {
         const styleId = "bizyair-plugin-style";
@@ -934,6 +1114,63 @@
         const style = document.createElement("style");
         style.id = styleId;
         style.textContent = `
+            .bizyair-stack {
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+            }
+            .bizyair-row {
+                display: flex;
+                gap: 10px;
+                align-items: center;
+                flex-wrap: wrap;
+            }
+            .bizyair-actions {
+                display: flex;
+                gap: 8px;
+                flex-wrap: wrap;
+            }
+            .bizyair-two-col {
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 10px;
+            }
+            .bizyair-modal-shell {
+                width: min(1180px, calc(100vw - 32px));
+                max-width: 1180px;
+                height: min(92vh, 940px);
+                max-height: 92vh;
+                background: #181818;
+                border: 1px solid #333;
+                border-radius: 14px;
+                box-shadow: 0 24px 80px rgba(0,0,0,0.45);
+                overflow: hidden;
+                display: flex;
+                flex-direction: column;
+            }
+            .bizyair-panel-card {
+                margin-bottom: 15px;
+                padding: 12px;
+                background: #2a2a2a;
+                border-radius: 8px;
+            }
+            .bizyair-view-scroll {
+                padding: 16px;
+                overflow-y: auto;
+                max-height: calc(92vh - 112px);
+                padding-bottom: 96px;
+                box-sizing: border-box;
+            }
+            .bizyair-view-end-spacer {
+                height: max(88px, calc(env(safe-area-inset-bottom) + 72px));
+                flex: 0 0 auto;
+            }
+            .bizyair-compact-label {
+                display: block;
+                margin-bottom: 5px;
+                color: #aaa;
+                font-size: 12px;
+            }
             .bizyair-inject-btn {
                 display: inline-flex;
                 align-items: center;
@@ -1091,9 +1328,108 @@
                 cursor: pointer;
                 font-weight: bold;
                 margin-right: 10px;
+                white-space: nowrap;
             }
             .bizyair-btn-primary { background: #8b5cf6; color: white; }
             .bizyair-btn-secondary { background: #444; color: #aaa; }
+            @media screen and (min-width: 1280px) {
+                .bizyair-modal-shell {
+                    width: min(1280px, calc(100vw - 48px));
+                }
+                .bizyair-view-scroll {
+                    padding: 18px 20px;
+                }
+            }
+            @media screen and (max-width: 900px) {
+                .bizyair-two-col {
+                    grid-template-columns: 1fr;
+                }
+                .bizyair-view-scroll {
+                    max-height: calc(100vh - 108px);
+                    padding-bottom: 104px;
+                }
+            }
+            @media screen and (max-width: 768px) {
+                .bizyair-modal-shell {
+                    width: 100vw;
+                    height: 100vh;
+                    max-height: 100vh;
+                    border-radius: 0;
+                    border: none;
+                }
+                .bizyair-view-scroll {
+                    padding: 10px;
+                    padding-bottom: calc(env(safe-area-inset-bottom) + 120px);
+                    max-height: calc(100vh - 102px);
+                }
+                .bizyair-view-end-spacer {
+                    height: calc(env(safe-area-inset-bottom) + 132px);
+                }
+                .bizyair-row,
+                .bizyair-actions {
+                    flex-direction: column;
+                    align-items: stretch;
+                }
+                .bizyair-btn {
+                    width: 100%;
+                    margin-right: 0;
+                }
+                .bizyair-input,
+                select.bizyair-input {
+                    font-size: 16px;
+                    padding: 12px 10px;
+                }
+                .bizyair-result-img {
+                    max-width: min(100%, 280px);
+                    max-height: 260px;
+                }
+                #bizyair-magic-action-modal {
+                    position: fixed !important;
+                    inset: 0 !important;
+                    width: 100dvw !important;
+                    height: 100dvh !important;
+                    z-index: 2147483646 !important;
+                    align-items: center !important;
+                    justify-content: center !important;
+                    padding: max(12px, env(safe-area-inset-top)) 12px max(12px, env(safe-area-inset-bottom)) 12px !important;
+                    box-sizing: border-box;
+                    overflow-y: auto;
+                    isolation: isolate;
+                }
+                #bizyair-magic-action-modal .bizyair-modal-shell {
+                    width: min(100%, 420px) !important;
+                    height: auto !important;
+                    max-height: calc(100vh - max(24px, env(safe-area-inset-top)) - max(24px, env(safe-area-inset-bottom))) !important;
+                    margin: 0 auto !important;
+                    border: 1px solid #333 !important;
+                    border-radius: 12px !important;
+                }
+                #bizyair-character-build-modal {
+                    position: fixed !important;
+                    inset: 0 !important;
+                    width: 100dvw !important;
+                    height: 100dvh !important;
+                    z-index: 2147483647 !important;
+                    align-items: center !important;
+                    justify-content: center !important;
+                    padding: max(12px, env(safe-area-inset-top)) 12px max(12px, env(safe-area-inset-bottom)) 12px !important;
+                    box-sizing: border-box;
+                    overflow-y: auto;
+                    isolation: isolate;
+                }
+                #bizyair-character-build-modal .bizyair-modal-shell {
+                    width: min(100%, 760px) !important;
+                    max-width: 760px !important;
+                    height: auto !important;
+                    max-height: calc(100vh - max(24px, env(safe-area-inset-top)) - max(24px, env(safe-area-inset-bottom))) !important;
+                    margin: 0 auto !important;
+                    border: 1px solid #333 !important;
+                    border-radius: 12px !important;
+                }
+                #bizyair-character-build-modal .bizyair-view-scroll {
+                    max-height: calc(100vh - max(120px, env(safe-area-inset-top)) - max(24px, env(safe-area-inset-bottom))) !important;
+                }
+            }
         `;
         document.head.appendChild(style);
     }
@@ -1112,6 +1448,1243 @@
             t.classList.add("show");
             setTimeout(() => t.classList.remove("show"), 2500);
         }
+    }
+
+    function savePromptPresets(type) {
+        try {
+            localStorage.setItem(`${BIZYAIR_PRESET_PREFIX}${type}`, JSON.stringify(promptPresets[type] || []));
+        } catch (e) {
+            console.error(`保存 ${type} 预设失败:`, e);
+        }
+    }
+
+    function normalizeImportedPresetList(list, type) {
+        if (!Array.isArray(list)) return [];
+        return list.map((item, index) => ({
+            id: item.id || Date.now() + index,
+            name: item.name || `导入预设 ${index + 1}`,
+            content: item.content || "",
+            active: !!item.active,
+            history: Array.isArray(item.history) ? item.history : (type === "char" ? [] : [])
+        }));
+    }
+
+    function mergeImportedPromptPresets(imported) {
+        ["jailbreak", "task", "char"].forEach(type => {
+            mergePromptPresetType(type, imported?.[type]);
+        });
+        renderAllPromptPresetLists();
+        updateSystemPromptPreview();
+    }
+
+    function getFullSystemPrompt() {
+        const jailbreak = promptPresets.jailbreak.find(item => item.active)?.content || "";
+        const task = promptPresets.task.find(item => item.active)?.content || "";
+        const chars = promptPresets.char.filter(item => item.active).map(item => item.content).join("\n\n");
+        return [jailbreak, task, chars].filter(Boolean).join("\n\n---\n\n");
+    }
+
+    function getTaskPresetContentByName(name) {
+        const exact = (promptPresets.task || []).find(item => item.name === name);
+        return exact?.content || "";
+    }
+
+    function getPresetContentByApproxName(type, targetName) {
+        const normalizedTarget = String(targetName || "").trim().toLowerCase();
+        if (!normalizedTarget) return "";
+        const list = promptPresets[type] || [];
+        const exact = list.find(item => String(item.name || "").trim().toLowerCase() === normalizedTarget);
+        if (exact?.content) return exact.content;
+        const fuzzy = list.find(item => String(item.name || "").trim().toLowerCase().includes(normalizedTarget));
+        return fuzzy?.content || "";
+    }
+
+    function getPromptPresetById(type, id) {
+        return (promptPresets[type] || []).find(entry => entry.id === id) || null;
+    }
+
+    function getPromptPresetEditorElements(type) {
+        return {
+            nameEl: document.getElementById(`bizyair-inp-${type}-name`),
+            contentEl: document.getElementById(`bizyair-inp-${type}-content`),
+            statusEl: document.getElementById(`bizyair-preset-status-${type}`)
+        };
+    }
+
+    function setPromptPresetEditorStatus(type, message, color = "#777") {
+        const { statusEl } = getPromptPresetEditorElements(type);
+        if (!statusEl) return;
+        statusEl.textContent = message || "";
+        statusEl.style.color = color;
+    }
+
+    function updatePromptPresetEditorState(type) {
+        const selected = getPromptPresetById(type, presetEditorSelection[type]);
+        if (selected) {
+            const historyCount = Array.isArray(selected.history) ? selected.history.length : 0;
+            setPromptPresetEditorStatus(
+                type,
+                `当前正在编辑：${selected.name}${historyCount > 0 ? ` | 历史版本 ${historyCount}` : ""}`,
+                "#a78bfa"
+            );
+            return;
+        }
+        setPromptPresetEditorStatus(type, "当前为新建模式", "#777");
+    }
+
+    function clearPromptPresetEditor(type) {
+        const { nameEl, contentEl } = getPromptPresetEditorElements(type);
+        if (nameEl) nameEl.value = "";
+        if (contentEl) contentEl.value = "";
+        presetEditorSelection[type] = null;
+        updatePromptPresetEditorState(type);
+    }
+
+    function snapshotPromptPresetHistory(item) {
+        return {
+            name: item.name || "",
+            content: item.content || "",
+            active: !!item.active,
+            savedAt: new Date().toISOString()
+        };
+    }
+
+    function pushPromptPresetHistory(item) {
+        if (!item) return;
+        if (!Array.isArray(item.history)) item.history = [];
+        if (String(item.content || "").trim() || String(item.name || "").trim()) {
+            item.history.unshift(snapshotPromptPresetHistory(item));
+            item.history = item.history.slice(0, 20);
+        }
+    }
+
+    function buildUniquePromptPresetName(type, rawName, ignoreId = null) {
+        const baseName = String(rawName || "").trim() || "未命名预设";
+        const normalized = value => String(value || "").trim().toLowerCase();
+        const existingNames = new Set(
+            (promptPresets[type] || [])
+                .filter(item => item && item.id !== ignoreId)
+                .map(item => normalized(item.name))
+        );
+        if (!existingNames.has(normalized(baseName))) {
+            return baseName;
+        }
+        let index = 2;
+        let nextName = `${baseName} ${index}`;
+        while (existingNames.has(normalized(nextName))) {
+            index += 1;
+            nextName = `${baseName} ${index}`;
+        }
+        return nextName;
+    }
+
+    function exportPromptPresetsAsFile(type, payload, fileLabel) {
+        const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = fileLabel;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    function mergePromptPresetType(type, incomingList) {
+        const incoming = normalizeImportedPresetList(incomingList, type);
+        if (incoming.length === 0) return 0;
+
+        const existing = promptPresets[type] || [];
+        const merged = [...existing];
+        let changed = 0;
+
+        incoming.forEach(item => {
+            const existingIdx = merged.findIndex(entry => String(entry.name || "").trim() === String(item.name || "").trim());
+            if (existingIdx >= 0) {
+                pushPromptPresetHistory(merged[existingIdx]);
+                merged[existingIdx] = {
+                    ...merged[existingIdx],
+                    ...item,
+                    id: merged[existingIdx].id || item.id
+                };
+                changed += 1;
+            } else {
+                merged.push(item);
+                changed += 1;
+            }
+        });
+
+        promptPresets[type] = type === "char"
+            ? merged
+            : ensureExclusivePresetState(type, merged);
+        savePromptPresets(type);
+        renderPromptPresetList(type);
+        updatePromptPresetEditorState(type);
+        updateSystemPromptPreview();
+        return changed;
+    }
+
+    function getPreferredTaskPresetContent(preferredName) {
+        return getTaskPresetContentByName(preferredName)
+            || getPresetContentByApproxName("task", preferredName)
+            || promptPresets.task.find(item => item.active)?.content
+            || "";
+    }
+
+    function normalizeCharacterPromptContent(content, mode) {
+        const clean = String(content || "").trim();
+        if (!clean) return "";
+        if (mode !== "chat_tags") return clean;
+        if (/<资料>[\s\S]*<\/资料>/i.test(clean)) return clean;
+        return `<资料>\n${clean}\n</资料>`;
+    }
+
+    function getCurrentCharacterNameSafe() {
+        try {
+            const context = getSillyTavernContextSafe();
+            const characterId = context?.characterId;
+            if (characterId === undefined || characterId === null || characterId < 0) return "";
+            const character = context?.characters?.[characterId];
+            return String(character?.name || character?.data?.name || "").trim();
+        } catch (e) {
+            console.warn("读取当前角色名称失败:", e);
+            return "";
+        }
+    }
+
+    function getPreferredCharacterPromptForChatTags() {
+        const list = promptPresets.char || [];
+        if (list.length === 0) return "";
+
+        const currentCharacterName = getCurrentCharacterNameSafe().toLowerCase();
+        const normalizedEntries = list.map(item => ({
+            item,
+            name: String(item?.name || "").trim().toLowerCase()
+        }));
+
+        const exactMatch = currentCharacterName
+            ? normalizedEntries.find(entry => entry.name === currentCharacterName)?.item
+            : null;
+        if (exactMatch?.content) {
+            return normalizeCharacterPromptContent(exactMatch.content, "chat_tags");
+        }
+
+        const fuzzyMatch = currentCharacterName
+            ? normalizedEntries.find(entry => entry.name && currentCharacterName.includes(entry.name))?.item
+                || normalizedEntries.find(entry => entry.name && entry.name.includes(currentCharacterName))?.item
+            : null;
+        if (fuzzyMatch?.content) {
+            return normalizeCharacterPromptContent(fuzzyMatch.content, "chat_tags");
+        }
+
+        const activeMatch = list.find(item => item?.active && String(item.content || "").trim());
+        if (activeMatch?.content) {
+            return normalizeCharacterPromptContent(activeMatch.content, "chat_tags");
+        }
+
+        const latestMatch = [...list].reverse().find(item => String(item?.content || "").trim());
+        return latestMatch?.content
+            ? normalizeCharacterPromptContent(latestMatch.content, "chat_tags")
+            : "";
+    }
+
+    function getSystemPromptForMode(mode) {
+        const jailbreak = promptPresets.jailbreak.find(item => item.active)?.content || "";
+        if (mode === "character_build") {
+            const characterBuildTask = getPreferredTaskPresetContent("角色生成");
+            return [jailbreak, characterBuildTask].filter(Boolean).join("\n\n---\n\n");
+        }
+
+        const defaultTask = getPreferredTaskPresetContent("日常生图");
+        const chars = getPreferredCharacterPromptForChatTags();
+        return [jailbreak, defaultTask, chars].filter(Boolean).join("\n\n---\n\n");
+    }
+
+    function updateSystemPromptPreview() {
+        const el = document.getElementById("bizyair-llm-system-preview");
+        if (el) el.value = getFullSystemPrompt();
+    }
+
+    function updateTagContextInput() {
+        const el = document.getElementById("bizyair-tag-context");
+        if (el) el.value = capturedContext;
+    }
+
+    function updateBizyairPositivePrompt(promptText) {
+        if (!promptText) return;
+        imageParams.positivePrompt = promptText;
+        saveTemplateParams(bizyairTemplate, imageParams);
+        const el = document.getElementById("bizyair-pos-prompt");
+        if (el) el.value = promptText;
+    }
+
+    function saveLlmSettings() {
+        localStorage.setItem(BIZYAIR_LLM_URL_KEY, llmSettings.url);
+        localStorage.setItem(BIZYAIR_LLM_KEY_KEY, llmSettings.key);
+        localStorage.setItem(BIZYAIR_LLM_MODEL_KEY, llmSettings.model);
+        try {
+            localStorage.removeItem("bizyair_llm_sys");
+        } catch (e) {
+            console.warn("清理旧 system prompt 存储失败:", e);
+        }
+    }
+
+    function renderPromptPresetList(type) {
+        const container = document.getElementById(`bizyair-list-${type}`);
+        if (!container) return;
+        const list = promptPresets[type] || [];
+        if (list.length === 0) {
+            container.innerHTML = `<div style="font-size:12px;color:#666;padding:8px 0;">暂无预设</div>`;
+            return;
+        }
+
+        container.innerHTML = list.map(item => {
+            const isSelected = presetEditorSelection[type] === item.id;
+            const activeStyle = item.active ? "border:1px solid #8b5cf6;background:#2a2135;" : "border:1px solid #3a3a3a;background:#202020;";
+            const selectedStyle = isSelected ? "box-shadow:0 0 0 1px #38bdf8 inset;" : "";
+            const preview = escapeHtml((item.content || "").substring(0, 90).replace(/\n/g, " "));
+            const historyCount = Array.isArray(item.history) ? item.history.length : 0;
+            const activeBtn = type === "char"
+                ? `<button class="bizyair-btn" style="padding:4px 8px;font-size:11px;background:${item.active ? '#16a34a' : '#4b5563'};color:white;" onclick="event.stopPropagation();window.toggleBizyairPromptPreset('${type}', ${item.id})">${item.active ? '启用中' : '启用'}</button>`
+                : `<button class="bizyair-btn" style="padding:4px 8px;font-size:11px;background:${item.active ? '#16a34a' : '#4b5563'};color:white;" onclick="event.stopPropagation();window.toggleBizyairPromptPreset('${type}', ${item.id})">${item.active ? '默认' : '设为默认'}</button>`;
+            return `
+                <div style="display:flex;gap:8px;align-items:flex-start;padding:8px;border-radius:6px;${activeStyle}${selectedStyle};margin-top:8px;" onclick="window.loadBizyairPresetToEditor('${type}', ${item.id})">
+                    <div style="flex:1;min-width:0;">
+                        <div style="font-weight:bold;color:#ddd;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(item.name)}</div>
+                        <div style="font-size:11px;color:#888;word-break:break-word;">${preview || "空内容"}</div>
+                        <div style="font-size:11px;color:#666;margin-top:4px;">${isSelected ? "正在编辑" : "点击载入编辑"}${historyCount > 0 ? ` | 历史 ${historyCount}` : ""}</div>
+                    </div>
+                    <div style="display:flex;gap:6px;flex:0 0 auto;">
+                        ${activeBtn}
+                        <button class="bizyair-btn" style="padding:4px 8px;font-size:11px;background:#2563eb;color:white;" onclick="event.stopPropagation();window.loadBizyairPresetToEditor('${type}', ${item.id})">编辑</button>
+                        <button class="bizyair-btn" style="padding:4px 8px;font-size:11px;background:#7c3aed;color:white;" onclick="event.stopPropagation();window.cloneBizyairPromptPreset('${type}', ${item.id})">复制</button>
+                        <button class="bizyair-btn" style="padding:4px 8px;font-size:11px;background:#ef4444;color:white;" onclick="event.stopPropagation();window.deleteBizyairPromptPreset('${type}', ${item.id})">删除</button>
+                    </div>
+                </div>
+            `;
+        }).join("");
+    }
+
+    function renderAllPromptPresetLists() {
+        renderPromptPresetList("jailbreak");
+        renderPromptPresetList("task");
+        renderPromptPresetList("char");
+        updatePromptPresetEditorState("jailbreak");
+        updatePromptPresetEditorState("task");
+        updatePromptPresetEditorState("char");
+    }
+
+    function renderLlmPanelState() {
+        const urlInput = document.getElementById("bizyair-llm-url");
+        const keyInput = document.getElementById("bizyair-llm-key");
+        const modelInput = document.getElementById("bizyair-llm-model");
+        const autoTagInput = document.getElementById("bizyair-auto-tag");
+        const statusEl = document.getElementById("bizyair-llm-model-status");
+        if (urlInput) urlInput.value = llmSettings.url;
+        if (keyInput) keyInput.value = llmSettings.key;
+        if (modelInput) modelInput.value = llmSettings.model;
+        if (autoTagInput) autoTagInput.checked = autoTagEnabled;
+        if (statusEl && !statusEl.dataset.preserve) {
+            statusEl.textContent = "";
+            statusEl.style.color = "#777";
+        }
+        updateSystemPromptPreview();
+        updateTagContextInput();
+        renderAllPromptPresetLists();
+    }
+
+    async function fetchBizyairLlmModels() {
+        const urlInput = document.getElementById("bizyair-llm-url");
+        const keyInput = document.getElementById("bizyair-llm-key");
+        const currentUrl = urlInput ? urlInput.value.trim() : llmSettings.url;
+        const currentKey = keyInput ? keyInput.value.trim() : llmSettings.key;
+
+        if (!currentUrl || !currentKey) {
+            showToast("请先填写 LLM URL 和 API Key");
+            return;
+        }
+
+        const statusEl = document.getElementById("bizyair-llm-model-status");
+        const container = document.getElementById("bizyair-llm-model-container");
+        if (statusEl) {
+            statusEl.textContent = "拉取中...";
+            statusEl.style.color = "#888";
+            statusEl.dataset.preserve = "true";
+        }
+
+        try {
+            let url = currentUrl.replace(/\/$/, "");
+            if (url.endsWith("/chat/completions")) url = url.slice(0, -"/chat/completions".length);
+            if (url.endsWith("/models")) url = url.slice(0, -"/models".length);
+            const response = await fetch(`${url}/models`, {
+                method: "GET",
+                headers: {
+                    "Authorization": `Bearer ${currentKey}`
+                }
+            });
+            if (!response.ok) {
+                throw new Error(await response.text());
+            }
+            const data = await response.json();
+            const models = (data.data || data.models || [])
+                .map(item => typeof item === "string" ? item : item.id)
+                .filter(Boolean);
+            if (!container || models.length === 0) {
+                throw new Error("未返回可用模型");
+            }
+
+            const selectedModel = llmSettings.model;
+            container.innerHTML = `
+                <select id="bizyair-llm-model" class="bizyair-input" style="margin-bottom:0;">
+                    ${models.map(model => `<option value="${escapeHtml(model)}" ${model === selectedModel ? "selected" : ""}>${escapeHtml(model)}</option>`).join("")}
+                </select>
+            `;
+            const modelEl = document.getElementById("bizyair-llm-model");
+            if (modelEl && !models.includes(selectedModel)) {
+                modelEl.value = models[0];
+            }
+            if (statusEl) {
+                statusEl.textContent = `已拉取 ${models.length} 个模型，确认无误后点击下方保存`;
+                statusEl.style.color = "#16a34a";
+            }
+        } catch (e) {
+            console.error("拉取模型列表失败:", e);
+            if (statusEl) {
+                statusEl.textContent = "拉取失败";
+                statusEl.style.color = "#ef4444";
+            }
+            showToast(`❌ 拉取模型失败: ${e.message || e}`);
+        }
+    }
+
+    function getSillyTavernContextSafe() {
+        try {
+            if (window.SillyTavern && typeof window.SillyTavern.getContext === "function") {
+                return window.SillyTavern.getContext();
+            }
+        } catch (e) {
+            console.warn("通过 window.SillyTavern.getContext 获取上下文失败:", e);
+        }
+
+        try {
+            if (typeof window.getContext === "function") {
+                return window.getContext();
+            }
+        } catch (e) {
+            console.warn("通过 window.getContext 获取上下文失败:", e);
+        }
+
+        return null;
+    }
+
+    async function ensureCharacterLoaded(context, characterId) {
+        if (!context || characterId === undefined || characterId === null) return null;
+        let character = context.characters?.[characterId] || null;
+        if (character?.shallow && typeof context.unshallowCharacter === "function") {
+            try {
+                await context.unshallowCharacter(characterId);
+                character = context.characters?.[characterId] || character;
+            } catch (e) {
+                console.warn("展开角色卡失败:", e);
+            }
+        }
+        return character;
+    }
+
+    function normalizeLorebookEntries(data, worldName) {
+        if (!data) return [];
+        const entries = Array.isArray(data.entries)
+            ? data.entries
+            : Object.values(data.entries || {});
+        return entries
+            .filter(Boolean)
+            .map((entry, index) => ({
+                id: entry.uid ?? entry.id ?? index,
+                world: worldName || data.name || "",
+                keys: Array.isArray(entry.keys) ? entry.keys : [],
+                secondary_keys: Array.isArray(entry.secondary_keys) ? entry.secondary_keys : [],
+                comment: entry.comment || "",
+                content: entry.content || "",
+                enabled: entry.enabled !== false
+            }));
+    }
+
+    async function buildCharacterBuildContext() {
+        const context = getSillyTavernContextSafe();
+        if (!context) {
+            throw new Error("未获取到 SillyTavern 上下文");
+        }
+        if (context.characterId === undefined || context.characterId === null || context.characterId < 0) {
+            throw new Error("当前未打开角色卡聊天");
+        }
+
+        const character = await ensureCharacterLoaded(context, context.characterId);
+        if (!character) {
+            throw new Error("当前角色数据不可用");
+        }
+
+        const card = character.data || character;
+        const lines = [];
+        const pushField = (label, value) => {
+            if (value === undefined || value === null) return;
+            if (Array.isArray(value) && value.length === 0) return;
+            const text = Array.isArray(value) ? value.join(", ") : String(value).trim();
+            if (!text) return;
+            lines.push(`[${label}]`);
+            lines.push(text);
+            lines.push("");
+        };
+
+        pushField("角色名", character.name || card.name || "");
+        pushField("描述", card.description || "");
+        pushField("性格", card.personality || "");
+        pushField("场景", card.scenario || "");
+        pushField("首条消息", card.first_mes || "");
+        pushField("示例对话", card.mes_example || "");
+        pushField("作者备注", card.creator_notes || card.creatorcomment || "");
+        pushField("系统提示词", card.system_prompt || "");
+        pushField("历史后指令", card.post_history_instructions || "");
+        pushField("标签", card.tags || []);
+        pushField("备用问候", card.alternate_greetings || []);
+
+        const worldSections = [];
+        const appendWorldSection = (title, entries) => {
+            if (!entries || entries.length === 0) return;
+            const formatted = entries.map((entry, idx) => {
+                const parts = [
+                    `条目 ${idx + 1}`,
+                    entry.keys?.length ? `主键: ${entry.keys.join(", ")}` : "",
+                    entry.secondary_keys?.length ? `副键: ${entry.secondary_keys.join(", ")}` : "",
+                    entry.comment ? `备注: ${entry.comment}` : "",
+                    entry.content ? `内容: ${entry.content}` : ""
+                ].filter(Boolean);
+                return parts.join("\n");
+            }).join("\n\n");
+            worldSections.push(`[${title}]`);
+            worldSections.push(formatted);
+            worldSections.push("");
+        };
+
+        const primaryWorldName = card.extensions?.world || "";
+        if (primaryWorldName && typeof context.loadWorldInfo === "function") {
+            try {
+                const worldData = await context.loadWorldInfo(primaryWorldName);
+                appendWorldSection(`关联世界书: ${primaryWorldName}`, normalizeLorebookEntries(worldData, primaryWorldName));
+            } catch (e) {
+                console.warn("读取角色关联世界书失败:", e);
+            }
+        }
+
+        if (card.character_book) {
+            appendWorldSection(`角色卡内嵌世界书: ${card.character_book.name || `${character.name} Lorebook`}`, normalizeLorebookEntries(card.character_book, card.character_book.name || ""));
+        }
+
+        return [
+            "请基于下面的 SillyTavern 角色卡和关联世界书信息，完成角色构建并输出适合生图的结果。",
+            "",
+            ...lines,
+            ...worldSections
+        ].join("\n").trim();
+    }
+
+    function upsertCharacterPromptPreset(name, content) {
+        const safeName = String(name || "").trim() || "未命名角色";
+        const safeContent = String(content || "").trim();
+        if (!safeContent) return;
+
+        const existingIdx = promptPresets.char.findIndex(entry => entry.name === safeName);
+        let target = null;
+        if (existingIdx >= 0) {
+            pushPromptPresetHistory(promptPresets.char[existingIdx]);
+            promptPresets.char[existingIdx].content = safeContent;
+            promptPresets.char[existingIdx].active = true;
+            target = promptPresets.char[existingIdx];
+        } else {
+            target = {
+                id: Date.now(),
+                name: safeName,
+                content: safeContent,
+                active: true,
+                history: []
+            };
+            promptPresets.char.push(target);
+        }
+
+        promptPresets.char.forEach(entry => {
+            if (entry.name !== safeName) entry.active = false;
+        });
+        presetEditorSelection.char = target?.id || null;
+        savePromptPresets("char");
+        renderPromptPresetList("char");
+        updateSystemPromptPreview();
+        updatePromptPresetEditorState("char");
+    }
+
+    function openTaggerWithContext(text) {
+        capturedContext = text || "";
+        localStorage.setItem(BIZYAIR_CONTEXT_KEY, capturedContext);
+        updateTagContextInput();
+        const modal = document.getElementById("bizyair-settings-modal");
+        if (modal) {
+            modal.classList.add("show");
+            window.switchBizyairTab("tagger");
+        }
+    }
+
+    function getCleanApiUrl(pathType) {
+        let url = (llmSettings.url || "").trim().replace(/\/$/, "");
+        if (url.endsWith("/chat/completions")) url = url.slice(0, -"/chat/completions".length);
+        if (url.endsWith("/models")) url = url.slice(0, -"/models".length);
+        if (pathType === "chat") return `${url}/chat/completions`;
+        if (pathType === "models") return `${url}/models`;
+        return url;
+    }
+
+    function collectTextNodeMap(rootElement) {
+        let textMap = [];
+        let fullText = "";
+
+        function traverse(node) {
+            if (node.nodeType === Node.TEXT_NODE) {
+                for (let i = 0; i < node.nodeValue.length; i++) {
+                    textMap.push({ node, offset: i, char: node.nodeValue[i] });
+                }
+                fullText += node.nodeValue;
+            } else {
+                node.childNodes.forEach(traverse);
+            }
+        }
+
+        traverse(rootElement);
+        return { textMap, fullText };
+    }
+
+    function normalizeLocatorText(text) {
+        const raw = String(text || "").replace(/[\u200B-\u200D\uFEFF]/g, "");
+        let normalized = "";
+        let indexMap = [];
+        let hasPendingSpace = false;
+
+        for (let i = 0; i < raw.length; i++) {
+            const ch = raw[i];
+            if (/\s/.test(ch)) {
+                hasPendingSpace = normalized.length > 0;
+                continue;
+            }
+            if (hasPendingSpace) {
+                normalized += " ";
+                indexMap.push(i);
+                hasPendingSpace = false;
+            }
+            normalized += ch.toLowerCase();
+            indexMap.push(i);
+        }
+
+        if (normalized.endsWith(" ")) {
+            normalized = normalized.slice(0, -1);
+            indexMap.pop();
+        }
+
+        return {
+            raw,
+            normalized,
+            indexMap
+        };
+    }
+
+    function splitLocatorCandidates(locatorText) {
+        const clean = String(locatorText || "").trim();
+        if (!clean) return [];
+        const parts = clean
+            .split(/[\r\n。！？!?；;]+/g)
+            .map(part => part.trim())
+            .filter(Boolean);
+        const candidates = [clean];
+        parts
+            .sort((a, b) => b.length - a.length)
+            .forEach(part => {
+                if (part.length >= 6 && !candidates.includes(part)) {
+                    candidates.push(part);
+                }
+            });
+        return candidates;
+    }
+
+    function findLocatorRangeInText(fullText, locatorText) {
+        const exactCandidates = splitLocatorCandidates(locatorText);
+        for (const candidate of exactCandidates) {
+            const exactIndex = fullText.lastIndexOf(candidate);
+            if (exactIndex !== -1) {
+                return {
+                    start: exactIndex,
+                    end: exactIndex + candidate.length,
+                    matchedText: candidate,
+                    matchType: candidate === locatorText ? "exact" : "exact-fragment"
+                };
+            }
+        }
+
+        const normalizedFull = normalizeLocatorText(fullText);
+        for (const candidate of exactCandidates) {
+            const normalizedCandidate = normalizeLocatorText(candidate);
+            if (!normalizedCandidate.normalized) continue;
+            const normalizedIndex = normalizedFull.normalized.lastIndexOf(normalizedCandidate.normalized);
+            if (normalizedIndex === -1) continue;
+            const startOriginal = normalizedFull.indexMap[normalizedIndex];
+            const endOriginal = normalizedFull.indexMap[normalizedIndex + normalizedCandidate.normalized.length - 1];
+            if (startOriginal === undefined || endOriginal === undefined) continue;
+            return {
+                start: startOriginal,
+                end: endOriginal + 1,
+                matchedText: candidate,
+                matchType: candidate === locatorText ? "normalized" : "normalized-fragment"
+            };
+        }
+
+        return null;
+    }
+
+    function injectNodeAfterRange(rootElement, endExclusiveIndex, nodeToInject) {
+        const { textMap } = collectTextNodeMap(rootElement);
+        if (!textMap.length) return false;
+        if (endExclusiveIndex >= textMap.length) {
+            rootElement.appendChild(nodeToInject);
+            return true;
+        }
+        const mapEntry = textMap[endExclusiveIndex - 1];
+        if (!mapEntry) return false;
+        const targetNode = mapEntry.node;
+        const splitPoint = mapEntry.offset + 1;
+        if (splitPoint < targetNode.nodeValue.length) {
+            const remainderNode = targetNode.splitText(splitPoint);
+            targetNode.parentNode.insertBefore(nodeToInject, remainderNode);
+        } else if (targetNode.nextSibling) {
+            targetNode.parentNode.insertBefore(nodeToInject, targetNode.nextSibling);
+        } else {
+            targetNode.parentNode.appendChild(nodeToInject);
+        }
+        return true;
+    }
+
+    function injectNodeAfterText(rootElement, searchText, nodeToInject) {
+        const { fullText } = collectTextNodeMap(rootElement);
+        const range = findLocatorRangeInText(fullText, searchText);
+        if (!range) return false;
+        return injectNodeAfterRange(rootElement, range.end, nodeToInject);
+    }
+
+    function getMessageIdFromElement(messageEl) {
+        const mes = messageEl?.closest?.(".mes");
+        if (!mes) return -1;
+        const rawId = mes.getAttribute("mesid");
+        const messageId = Number(rawId);
+        return Number.isFinite(messageId) ? messageId : -1;
+    }
+
+    async function persistMessageTextUpdate(messageId, nextText) {
+        const context = getSillyTavernContextSafe();
+        if (!context || !Array.isArray(context.chat)) return false;
+        if (!Number.isInteger(messageId) || messageId < 0 || messageId >= context.chat.length) return false;
+
+        const message = context.chat[messageId];
+        if (!message) return false;
+
+        message.mes = nextText;
+        if (typeof context.updateMessageBlock === "function") {
+            context.updateMessageBlock(messageId, message);
+        }
+        if (typeof context.saveChat === "function") {
+            await context.saveChat();
+        }
+        return true;
+    }
+
+    async function insertImageTagIntoMessageSource(messageEl, locatorText, imageTag) {
+        const messageId = getMessageIdFromElement(messageEl);
+        const context = getSillyTavernContextSafe();
+        const rawMessage = context?.chat?.[messageId]?.mes;
+        if (typeof rawMessage !== "string" || !rawMessage.trim()) return false;
+        if (rawMessage.includes(imageTag)) return true;
+
+        const range = findLocatorRangeInText(rawMessage, locatorText);
+        if (!range) return false;
+
+        const nextText = `${rawMessage.slice(0, range.end)} ${imageTag}${rawMessage.slice(range.end)}`;
+        return persistMessageTextUpdate(messageId, nextText);
+    }
+
+    function getLatestMessagesContext(count) {
+        const messages = Array.from(document.querySelectorAll(".mes_text"));
+        if (messages.length === 0) return "";
+        return messages.slice(-count).map(el => {
+            const clone = el.cloneNode(true);
+            clone.querySelectorAll(".bizyair-inject-wrapper, .bizyair-result-img, button").forEach(node => node.remove());
+            return clone.innerText.trim();
+        }).filter(Boolean).join("\n\n---\n\n");
+    }
+
+    function captureRecentChatContext() {
+        const text = getLatestMessagesContext(2);
+        if (!text) {
+            showToast("⚠️ 未找到聊天记录");
+            return "";
+        }
+        capturedContext = text;
+        localStorage.setItem(BIZYAIR_CONTEXT_KEY, capturedContext);
+        updateTagContextInput();
+        return capturedContext;
+    }
+
+    function injectTagTriggerIntoChat(locatorText, promptText) {
+        if (!locatorText || !promptText) return null;
+        const messages = document.querySelectorAll(".mes_text");
+        if (messages.length === 0) return null;
+        const cleanLocator = locatorText.trim();
+        const safePrompt = escapeHtml(promptText);
+        const slotId = `bizyair_locator_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+        const wrapper = document.createElement("span");
+        wrapper.className = "bizyair-inject-wrapper";
+        wrapper.setAttribute("data-slot-id", slotId);
+        wrapper.setAttribute("data-bizyair-locator", cleanLocator);
+        wrapper.innerHTML = `
+            <button class="bizyair-inject-btn" data-description="${encodeURIComponent(promptText)}" data-slot-id="${slotId}" data-bizyair-locator="${encodeURIComponent(cleanLocator)}" onclick="window.bizyairStartGenerate('${slotId}', this)">
+                <span>🖼️</span> 立即生成
+            </button>
+        `;
+
+        let injected = false;
+        for (let i = messages.length - 1; i >= 0; i--) {
+            const messageEl = messages[i];
+            if (injectNodeAfterText(messageEl, cleanLocator, wrapper)) {
+                injected = true;
+                break;
+            }
+        }
+        if (!injected) return null;
+        tempLocators[slotId] = cleanLocator;
+        wrapper.title = safePrompt;
+        return slotId;
+    }
+
+    async function insertImageTagIntoChat(locatorText, promptText) {
+        if (!locatorText || !promptText) return false;
+        const cleanLocator = String(locatorText).trim();
+        const cleanPrompt = String(promptText).trim().replace(/\s+/g, " ").replace(/#/g, ", ");
+        if (!cleanLocator || !cleanPrompt) return false;
+
+        const imageTag = `<image>image##${cleanPrompt}##<image>`;
+        const messages = Array.from(document.querySelectorAll(".mes_text"));
+        for (let i = messages.length - 1; i >= 0; i--) {
+            const messageEl = messages[i];
+            const text = messageEl.textContent || "";
+            if (text.includes(imageTag)) return true;
+            const inserted = await insertImageTagIntoMessageSource(messageEl, cleanLocator, imageTag);
+            if (inserted) {
+                setTimeout(() => scanAndInjectButtons(), 50);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    async function importBridgeBackupObject(data) {
+        if (!data || typeof data !== "object") {
+            throw new Error("备份文件格式无效");
+        }
+
+        const importedPresets = data.presets || data.promptPresets;
+        if (!importedPresets || typeof importedPresets !== "object") {
+            throw new Error("未找到可导入的预设数据");
+        }
+
+        mergeImportedPromptPresets(importedPresets);
+
+        const model = data.llmSettings?.model || data.llm?.model;
+        const url = data.llmSettings?.url || data.llm?.url;
+        if (url) llmSettings.url = url;
+        if (model) llmSettings.model = model;
+        saveLlmSettings();
+        renderLlmPanelState();
+    }
+
+    function extractLlmMessageContent(data) {
+        const choice = data?.choices?.[0] || null;
+        const messageContent = choice?.message?.content;
+        if (typeof messageContent === "string") {
+            return messageContent;
+        }
+        if (Array.isArray(messageContent)) {
+            return messageContent
+                .map(item => {
+                    if (typeof item === "string") return item;
+                    if (typeof item?.text === "string") return item.text;
+                    if (typeof item?.content === "string") return item.content;
+                    return "";
+                })
+                .filter(Boolean)
+                .join("\n")
+                .trim();
+        }
+        if (typeof choice?.text === "string") {
+            return choice.text;
+        }
+        if (typeof choice?.message?.refusal === "string" && choice.message.refusal.trim()) {
+            return choice.message.refusal.trim();
+        }
+        if (typeof choice?.message?.reasoning_content === "string" && choice.message.reasoning_content.trim()) {
+            return choice.message.reasoning_content.trim();
+        }
+        if (typeof data?.output_text === "string") {
+            return data.output_text;
+        }
+        if (Array.isArray(data?.output)) {
+            return data.output
+                .flatMap(item => Array.isArray(item?.content) ? item.content : [])
+                .map(item => typeof item?.text === "string" ? item.text : "")
+                .filter(Boolean)
+                .join("\n")
+                .trim();
+        }
+        if (typeof data?.response === "string") {
+            return data.response.trim();
+        }
+        return "";
+    }
+
+    function buildLlmEmptyResponseDebugInfo(data, systemPrompt, userPrompt, requestLabel) {
+        const choice = data?.choices?.[0] || null;
+        const previewSource = choice?.message
+            ?? choice
+            ?? data?.output?.[0]
+            ?? data;
+        const preview = (() => {
+            try {
+                return JSON.stringify(previewSource).slice(0, 600);
+            } catch (e) {
+                return String(previewSource || "").slice(0, 600);
+            }
+        })();
+        const finishReason = choice?.finish_reason || data?.finish_reason || "unknown";
+        const systemLength = String(systemPrompt || "").length;
+        const userLength = String(userPrompt || "").length;
+        return `${requestLabel || "llm"} 空回复 | finish_reason=${finishReason} | system_len=${systemLength} | user_len=${userLength} | preview=${preview}`;
+    }
+
+    async function requestBizyairLlm(systemPrompt, userPrompt, requestLabel = "llm") {
+        if (!userPrompt) {
+            throw new Error("缺少输入内容");
+        }
+        if (!llmSettings.key) {
+            throw new Error("请先填写独立 API Key");
+        }
+
+        const payload = {
+            model: llmSettings.model,
+            messages: [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: userPrompt }
+            ],
+            temperature: 0.7,
+            max_tokens: 1200
+        };
+
+        const response = await fetch(getCleanApiUrl("chat"), {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${llmSettings.key}`
+            },
+            body: JSON.stringify(payload)
+        });
+        const rawText = await response.text();
+        if (!response.ok) {
+            throw new Error(`${requestLabel} 请求失败: ${rawText}`);
+        }
+        let data;
+        try {
+            data = rawText ? JSON.parse(rawText) : {};
+        } catch (e) {
+            throw new Error(`${requestLabel} 返回非 JSON: ${rawText.slice(0, 600)}`);
+        }
+        const content = extractLlmMessageContent(data);
+        if (!String(content || "").trim()) {
+            const debugInfo = buildLlmEmptyResponseDebugInfo(data, systemPrompt, userPrompt, requestLabel);
+            console.error("独立 API 空回复详情:", {
+                requestLabel,
+                url: getCleanApiUrl("chat"),
+                payload,
+                response: data,
+                debugInfo
+            });
+            throw new Error(debugInfo);
+        }
+        return content;
+    }
+
+    function parseCharacterBuildOutput(text) {
+        const matches = [...String(text || "").matchAll(/<资料>([\s\S]*?)<\/资料>/g)];
+        if (matches.length === 0) {
+            return String(text || "").trim();
+        }
+        return matches.map(match => (match[1] || "").trim()).filter(Boolean).join("\n\n");
+    }
+
+    async function parseAndRenderTagOutput(text) {
+        const container = document.getElementById("bizyair-tag-output");
+        if (!container) return;
+        container.innerHTML = "";
+
+        const locatorRegex = /(<(?:角色|定位)>)([\s\S]*?)(<\/(?:角色|定位)>)/g;
+        const dataRegex = /<资料>([\s\S]*?)<\/资料>/g;
+        let currentRole = null;
+        let sceneIndex = 0;
+        let foundAny = false;
+        let match;
+
+        while ((match = locatorRegex.exec(text)) !== null) {
+            const tag = match[1];
+            const content = (match[2] || "").trim();
+            if (tag === "<角色>") {
+                currentRole = content;
+                updateBizyairPositivePrompt(content);
+                continue;
+            }
+            if (tag === "<定位>" && currentRole) {
+                sceneIndex += 1;
+                foundAny = true;
+                const inserted = await insertImageTagIntoChat(content, currentRole);
+                container.insertAdjacentHTML("beforeend", `
+                    <div data-bizyair-scene="${sceneIndex}" data-bizyair-locator="${escapeHtml(content)}" style="background:#202020;border:1px solid #333;border-radius:6px;padding:10px;margin-bottom:10px;">
+                        <div style="font-weight:bold;color:#a855f7;margin-bottom:6px;">场景 ${sceneIndex}</div>
+                        <div style="font-size:12px;color:#aaa;margin-bottom:6px;">定位: ${escapeHtml(content)}</div>
+                        <div style="font-size:12px;color:${inserted ? '#16a34a' : '#f59e0b'};margin-bottom:6px;">${inserted ? '已插入 image 标签到正文' : '未命中定位文本，未插入正文'}</div>
+                        <textarea class="bizyair-input" rows="3" data-role-prompt="${sceneIndex}" style="margin-bottom:8px;">${escapeHtml(currentRole)}</textarea>
+                        <div class="bizyair-actions">
+                            <button class="bizyair-btn bizyair-btn-primary" onclick="window.bizyairApplyRolePrompt(${sceneIndex})">写入正面提示词</button>
+                            <button class="bizyair-btn bizyair-btn-secondary" onclick="window.bizyairGenerateScene(${sceneIndex})">重新插入 image 标签</button>
+                        </div>
+                    </div>
+                `);
+                currentRole = null;
+            }
+        }
+
+        const dataMatches = [...text.matchAll(dataRegex)];
+        dataMatches.forEach((dataMatch, idx) => {
+            foundAny = true;
+            container.insertAdjacentHTML("beforeend", `
+                <div style="background:#202020;border:1px solid #333;border-radius:6px;padding:10px;margin-bottom:10px;">
+                    <div style="font-weight:bold;color:#f59e0b;margin-bottom:6px;">角色资料 ${idx + 1}</div>
+                    <textarea class="bizyair-input" rows="4" style="margin-bottom:0;">${escapeHtml((dataMatch[1] || "").trim())}</textarea>
+                </div>
+            `);
+        });
+
+        if (!foundAny) {
+            container.innerHTML = `<textarea class="bizyair-input" rows="8">${escapeHtml(text)}</textarea>`;
+        }
+    }
+
+    async function generatePromptTags() {
+        const input = document.getElementById("bizyair-tag-context");
+        const button = document.getElementById("bizyair-generate-tags-btn");
+        const contextText = input ? input.value.trim() : capturedContext.trim();
+        const output = document.getElementById("bizyair-tag-output");
+        if (!contextText) {
+            showToast("请输入剧情内容");
+            return;
+        }
+        if (!llmSettings.key) {
+            showToast("请先填写独立 API Key");
+            return;
+        }
+
+        capturedContext = contextText;
+        localStorage.setItem(BIZYAIR_CONTEXT_KEY, capturedContext);
+        if (button) {
+            button.disabled = true;
+            button.textContent = "分析中...";
+        }
+        if (output) {
+            output.innerHTML = `<div style="text-align:center;padding:20px;color:#777;">Thinking...</div>`;
+        }
+
+        try {
+            const content = await requestBizyairLlm(getSystemPromptForMode("chat_tags"), contextText, "chat_tags");
+            await parseAndRenderTagOutput(content);
+        } catch (e) {
+            console.error("独立 API 生成失败:", e);
+            if (output) {
+                output.innerHTML = `<div style="color:#ef4444;padding:10px;word-break:break-word;">${escapeHtml(String(e.message || e))}</div>`;
+            }
+            showToast("❌ 独立 API 生成失败");
+        } finally {
+            if (button) {
+                button.disabled = false;
+                button.textContent = "✨ 分析并生成 Tag";
+            }
+        }
+    }
+
+    function restoreLocatorImages() {
+        if (galleryData.length === 0) return;
+        const messages = document.querySelectorAll(".mes_text");
+        if (messages.length === 0) return;
+        const processedLocators = new Set();
+
+        galleryData.forEach(item => {
+            if (!item || !item.locator || !item.url || processedLocators.has(item.locator)) return;
+            for (let i = messages.length - 1; i >= 0; i--) {
+                const messageEl = messages[i];
+                if (messageEl.querySelector(`.bizyair-inject-wrapper[data-slot-id="${item.slotId}"]`)) {
+                    processedLocators.add(item.locator);
+                    break;
+                }
+                const wrapper = document.createElement("span");
+                wrapper.className = "bizyair-inject-wrapper";
+                renderImageResult(wrapper, item.slotId, item.prompt || "", item.url);
+                wrapper.setAttribute("data-bizyair-locator", item.locator);
+                if (injectNodeAfterText(messageEl, item.locator, wrapper)) {
+                    processedLocators.add(item.locator);
+                }
+                break;
+            }
+        });
+    }
+
+    function initLocatorRestoreObserver() {
+        if (restoreObserver) return;
+        restoreLocatorImages();
+        restoreObserver = new MutationObserver(() => {
+            if (restoreTimer) clearTimeout(restoreTimer);
+            restoreTimer = setTimeout(() => {
+                restoreLocatorImages();
+            }, 600);
+        });
+        restoreObserver.observe(document.body, { childList: true, subtree: true });
+    }
+
+    function closeMagicActionModal() {
+        const modal = document.getElementById("bizyair-magic-action-modal");
+        if (modal) modal.remove();
+    }
+
+    function closeCharacterBuildReviewModal() {
+        const modal = document.getElementById("bizyair-character-build-modal");
+        if (modal) modal.remove();
+    }
+
+    function renderCharacterBuildReviewState() {
+        const modal = document.getElementById("bizyair-character-build-modal");
+        if (!modal) return;
+
+        const titleEl = modal.querySelector("[data-bizyair-build-title]");
+        const textEl = modal.querySelector("[data-bizyair-build-text]");
+        const statusEl = modal.querySelector("[data-bizyair-build-status]");
+        const saveBtn = modal.querySelector("[data-bizyair-build-save]");
+        const retryBtn = modal.querySelector("[data-bizyair-build-retry]");
+
+        if (titleEl) {
+            titleEl.textContent = pendingCharacterBuild?.characterName
+                ? `角色资料预览: ${pendingCharacterBuild.characterName}`
+                : "角色资料预览";
+        }
+        if (textEl) {
+            textEl.value = pendingCharacterBuild?.profile || "";
+            textEl.disabled = !!pendingCharacterBuild?.loading;
+        }
+        if (statusEl) {
+            if (pendingCharacterBuild?.loading) {
+                statusEl.textContent = "正在生成角色资料...";
+                statusEl.style.color = "#888";
+            } else if (pendingCharacterBuild?.error) {
+                statusEl.textContent = `生成失败: ${pendingCharacterBuild.error}`;
+                statusEl.style.color = "#ef4444";
+            } else {
+                statusEl.textContent = "确认后保存，或打回重写。";
+                statusEl.style.color = "#aaa";
+            }
+        }
+        if (saveBtn) saveBtn.disabled = !!pendingCharacterBuild?.loading || !String(pendingCharacterBuild?.profile || "").trim();
+        if (retryBtn) retryBtn.disabled = !!pendingCharacterBuild?.loading;
+    }
+
+    function openCharacterBuildReviewModal() {
+        closeCharacterBuildReviewModal();
+        const modal = document.createElement("div");
+        modal.id = "bizyair-character-build-modal";
+        modal.style.cssText = "position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,0.72);display:flex;align-items:center;justify-content:center;padding:16px;";
+        modal.innerHTML = `
+            <div class="bizyair-modal-shell" style="width:min(760px, calc(100vw - 24px));max-width:760px;height:min(88vh,960px);background:#1c1c1c;">
+                <div class="bizyair-row" style="justify-content:space-between;padding:18px 18px 0 18px;">
+                    <div data-bizyair-build-title style="font-size:18px;font-weight:bold;">角色资料预览</div>
+                    <button type="button" class="bizyair-btn" style="margin-right:0;background:#333;color:#bbb;padding:6px 10px;" onclick="window.closeBizyairCharacterBuildModal()">关闭</button>
+                </div>
+                <div class="bizyair-view-scroll" style="padding-top:12px;">
+                    <div data-bizyair-build-status style="font-size:12px;color:#aaa;margin-bottom:10px;">确认后保存，或打回重写。</div>
+                    <textarea data-bizyair-build-text class="bizyair-input" rows="16" style="min-height:280px;margin-bottom:12px;"></textarea>
+                    <div class="bizyair-actions" style="justify-content:flex-end;">
+                    <button type="button" class="bizyair-btn bizyair-btn-secondary" data-bizyair-build-retry onclick="window.retryBizyairCharacterBuild()">打回重写</button>
+                    <button type="button" class="bizyair-btn bizyair-btn-primary" data-bizyair-build-save onclick="window.saveBizyairCharacterBuild()">保存</button>
+                    </div>
+                </div>
+            </div>
+        `;
+        modal.addEventListener("click", (event) => {
+            if (event.target === modal) closeCharacterBuildReviewModal();
+        });
+        document.body.appendChild(modal);
+        renderCharacterBuildReviewState();
+    }
+
+    async function runCharacterBuildRequest() {
+        if (!pendingCharacterBuild?.sourceText) {
+            throw new Error("缺少角色构建上下文");
+        }
+
+        pendingCharacterBuild.loading = true;
+        pendingCharacterBuild.error = "";
+        renderCharacterBuildReviewState();
+
+        try {
+            const content = await requestBizyairLlm(getSystemPromptForMode("character_build"), pendingCharacterBuild.sourceText, "character_build");
+            const profile = parseCharacterBuildOutput(content);
+            if (!String(profile || "").trim()) {
+                throw new Error("角色构建结果为空");
+            }
+            pendingCharacterBuild.profile = profile;
+        } catch (e) {
+            pendingCharacterBuild.profile = "";
+            pendingCharacterBuild.error = e.message || String(e);
+            throw e;
+        } finally {
+            pendingCharacterBuild.loading = false;
+            renderCharacterBuildReviewState();
+        }
+    }
+
+    function openMagicActionModal() {
+        closeMagicActionModal();
+        const modal = document.createElement("div");
+        modal.id = "bizyair-magic-action-modal";
+        modal.style.cssText = "position:fixed;inset:0;z-index:2147483646;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;padding:16px;";
+        modal.innerHTML = `
+            <div class="bizyair-modal-shell" style="width:min(420px, calc(100vw - 24px));max-width:420px;height:auto;background:#1c1c1c;padding:18px;">
+                <div class="bizyair-row" style="justify-content:space-between;margin-bottom:14px;">
+                    <div>
+                        <div style="font-size:18px;font-weight:bold;">独立 Tag 工具</div>
+                        <div style="font-size:12px;color:#888;margin-top:4px;">双击酒馆魔法棒后选择执行路径</div>
+                    </div>
+                    <button type="button" class="bizyair-btn" style="margin-right:0;background:#333;color:#bbb;padding:6px 10px;" onclick="window.closeBizyairMagicActionModal()">关闭</button>
+                </div>
+                <button type="button" class="bizyair-btn bizyair-btn-primary" style="width:100%;margin:0 0 10px 0;" onclick="window.startBizyairChatTagFlow()">开始生图</button>
+                <button type="button" class="bizyair-btn bizyair-btn-secondary" style="width:100%;margin:0;" onclick="window.startBizyairCharacterBuildFlow()">角色构建</button>
+            </div>
+        `;
+        modal.addEventListener("click", (event) => {
+            if (event.target === modal) closeMagicActionModal();
+        });
+        document.body.appendChild(modal);
     }
 
     function createSettingsModal() {
@@ -1139,7 +2712,7 @@
         const div = document.createElement("div");
         div.id = "bizyair-settings-modal";
         div.innerHTML = `
-            <div class="bizyair-modal-content">
+            <div class="bizyair-modal-content bizyair-modal-shell">
                 <div class="bizyair-modal-header">
                     <span>BizyAir 设置</span>
                     <span style="cursor:pointer;font-size:24px;line-height:1;" onclick="document.getElementById('bizyair-settings-modal').classList.remove('show')">&times;</span>
@@ -1147,33 +2720,39 @@
                 
                 <div class="bizyair-tabs" style="display:flex;background:#252525;border-bottom:1px solid #333;">
                     <div class="bizyair-tab active" data-tab="settings" onclick="window.switchBizyairTab('settings')" style="flex:1;text-align:center;padding:12px;cursor:pointer;color:#a855f7;border-bottom:2px solid #a855f7;">⚙️ 设置</div>
+                    <div class="bizyair-tab" data-tab="tagger" onclick="window.switchBizyairTab('tagger')" style="flex:1;text-align:center;padding:12px;cursor:pointer;color:#888;">🪄 Tag</div>
                     <div class="bizyair-tab" data-tab="gallery" onclick="window.switchBizyairTab('gallery')" style="flex:1;text-align:center;padding:12px;cursor:pointer;color:#888;">🖼️ 画廊</div>
                 </div>
                 
-                <div id="bizyair-view-settings" class="bizyair-view" style="padding:15px;overflow-y:auto;max-height:calc(90vh - 100px);">
-                    <div style="margin-bottom:15px;padding:10px;background:#2a2a2a;border-radius:4px;">
-                        <label style="display:block; margin-bottom:5px; color:#aaa; font-size:12px;">API Key</label>
-                        <input type="text" id="bizyair-api-key" class="bizyair-input" value="${bizyairApiKey}" placeholder="输入你的 API Key">
+                <div id="bizyair-view-settings" class="bizyair-view bizyair-view-scroll">
+                    <div class="bizyair-panel-card">
+                        <label class="bizyair-compact-label">API Key</label>
+                        <textarea id="bizyair-api-key" class="bizyair-input" rows="3" placeholder="输入你的 API Key，多个 Key 请用英文逗号分隔">${escapeHtml(bizyairApiKey)}</textarea>
 
-                        <label style="display:block; margin-bottom:5px; color:#aaa; font-size:12px;">生图模板</label>
+                        <label class="bizyair-compact-label">生图模板</label>
                         <select id="bizyair-template" class="bizyair-input" onchange="window.switchBizyairTemplate(this.value)">
                             ${templateOptions}
                         </select>
                         
-                        <label style="display:block; margin-bottom:5px; color:#aaa; font-size:12px;">Web App ID</label>
+                        <label class="bizyair-compact-label">Web App ID</label>
                         <input type="text" id="bizyair-web-app-id" class="bizyair-input" value="${bizyairWebAppId}" placeholder="默认: ${getTemplateDef(bizyairTemplate).defaultWebAppId}">
                     </div>
                     
-                    <div style="margin: 15px 0; padding: 10px; background: #2a2a2a; border-radius: 4px;">
+                    <div class="bizyair-panel-card">
                         <label style="display:flex; align-items:center; gap: 10px; cursor: pointer;">
                             <input type="checkbox" id="bizyair-auto-gen" ${autoGenEnabled ? 'checked' : ''} onchange="window.toggleAutoGen(this.checked)">
                             <span style="color:#ddd; font-size:13px;">检测到 image## 时自动生成图片</span>
                         </label>
+                        <label style="display:flex; align-items:center; gap: 10px; cursor: pointer; margin-top:8px;">
+                            <input type="checkbox" id="bizyair-queue-limit" ${queueLimitEnabled ? 'checked' : ''} onchange="window.toggleQueueLimit(this.checked)">
+                            <span style="color:#ddd; font-size:13px;">后台排队模式（最多同时发送 2 个请求）</span>
+                        </label>
+                        <div style="margin-top:6px;color:#888;font-size:12px;line-height:1.4;">适合免费账号：当前生成 1 张，队列里再占 1 张，后面的本地等待。</div>
                     </div>
                     
                     <h3 style="color:#a855f7;margin:15px 0 10px;font-size:14px;">🎨 生图参数</h3>
                     
-                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+                    <div class="bizyair-two-col">
                         <div>
                             <label style="color:#aaa;font-size:11px;">宽度</label>
                             <input type="number" id="bizyair-width" class="bizyair-input" value="${imageParams.width}" style="margin-bottom:0;">
@@ -1234,7 +2813,7 @@
                         <button type="button" class="bizyair-btn bizyair-btn-secondary" style="width:100%;" onclick="window.toggleBizyairAdvanced()">⚙️ 高级参数</button>
                     </div>
                     <div id="bizyair-advanced-panel" style="display:none;margin-top:10px;">
-                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+                        <div class="bizyair-two-col">
                             <div>
                                 <label style="color:#aaa;font-size:11px;">Scheduler</label>
                                 <input type="text" id="bizyair-scheduler" class="bizyair-input" value="${imageParams.scheduler || ''}" style="margin-bottom:0;">
@@ -1273,9 +2852,128 @@
 
                     <h3 style="color:#a855f7;margin:20px 0 10px;font-size:14px;">🗂️ 自定义模板管理</h3>
                     <div id="bizyair-custom-templates"></div>
+                    <div class="bizyair-view-end-spacer" aria-hidden="true"></div>
+                </div>
+
+                <div id="bizyair-view-tagger" class="bizyair-view bizyair-view-scroll" style="display:none;">
+                    <div style="margin-bottom:15px;padding:10px;background:#2a2a2a;border-radius:4px;">
+                        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;">
+                            <div>
+                                <div style="color:#ddd;font-weight:bold;">独立 API 配置</div>
+                                <div style="font-size:12px;color:#777;">迁移自 bridge 的提示词与解析链路</div>
+                            </div>
+                            <label style="display:flex;align-items:center;gap:8px;color:#ddd;font-size:13px;cursor:pointer;">
+                                <input type="checkbox" id="bizyair-auto-tag" ${autoTagEnabled ? "checked" : ""}>
+                                <span>解析后自动生图</span>
+                            </label>
+                        </div>
+
+                        <label style="display:block; margin-bottom:5px; color:#aaa; font-size:12px;">LLM URL</label>
+                        <input type="text" id="bizyair-llm-url" class="bizyair-input" value="${escapeHtml(llmSettings.url)}" placeholder="https://api.openai.com/v1">
+
+                        <label style="display:block; margin-bottom:5px; color:#aaa; font-size:12px;">LLM API Key</label>
+                        <input type="password" id="bizyair-llm-key" class="bizyair-input" value="${escapeHtml(llmSettings.key)}" placeholder="输入你的独立 API Key">
+
+                        <label style="display:block; margin-bottom:5px; color:#aaa; font-size:12px;">Model</label>
+                        <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
+                            <div id="bizyair-llm-model-container" style="flex:1;">
+                                <input type="text" id="bizyair-llm-model" class="bizyair-input" value="${escapeHtml(llmSettings.model)}" placeholder="gpt-4o-mini" style="margin-bottom:0;">
+                            </div>
+                            <button class="bizyair-btn bizyair-btn-secondary" style="margin:0;padding:8px 12px;font-size:12px;white-space:nowrap;flex:0 0 auto;width:auto;" onclick="window.fetchBizyairLlmModels()">拉取模型</button>
+                        </div>
+                        <div id="bizyair-llm-model-status" data-preserve="false" style="margin:0 0 10px;color:#777;font-size:12px;line-height:1.5;"></div>
+
+                        <label style="display:block; margin-bottom:5px; color:#aaa; font-size:12px;">组合后 System Prompt 预览</label>
+                        <textarea id="bizyair-llm-system-preview" class="bizyair-input" rows="5" readonly style="color:#aaa;"></textarea>
+
+                        <button class="bizyair-btn bizyair-btn-primary" style="width:100%;" onclick="window.saveBizyairLlmSettings()">💾 保存独立 API 设置</button>
+                    </div>
+
+                    <div style="margin-bottom:15px;padding:10px;background:#2a2a2a;border-radius:4px;">
+                        <div style="color:#ddd;font-weight:bold;margin-bottom:10px;">系统预设</div>
+                        <div style="margin-bottom:12px;padding:10px;background:#222;border:1px solid #333;border-radius:6px;">
+                            <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px;">
+                                <div>
+                                    <div style="color:#ddd;font-size:13px;">Bridge 备份导入</div>
+                                    <div style="font-size:12px;color:#777;">支持导入 ComfyBridge_Backup_*.json 中的 presets</div>
+                                </div>
+                                <input type="file" id="bizyair-bridge-backup-file" accept=".json,application/json" style="display:none;" onchange="window.importBizyairBridgeBackup(this)">
+                                <label for="bizyair-bridge-backup-file" class="bizyair-btn bizyair-btn-primary" style="margin:0;">一键导入</label>
+                            </div>
+                        </div>
+                        <div style="display:grid;grid-template-columns:1fr;gap:15px;">
+                            <div>
+                                <div style="color:#f87171;font-size:13px;margin-bottom:6px;">🔓 Jailbreak</div>
+                                <input type="text" id="bizyair-inp-jailbreak-name" class="bizyair-input" placeholder="预设名称">
+                                <textarea id="bizyair-inp-jailbreak-content" class="bizyair-input" rows="4" placeholder="输入 jailbreak 内容"></textarea>
+                                <div class="bizyair-actions" style="margin-bottom:8px;">
+                                    <button class="bizyair-btn bizyair-btn-secondary" onclick="window.newBizyairPromptPreset('jailbreak')">新建空白</button>
+                                    <button class="bizyair-btn bizyair-btn-primary" onclick="window.saveBizyairPromptPreset('jailbreak')">保存修改</button>
+                                    <button class="bizyair-btn" style="background:#7c3aed;color:white;" onclick="window.saveBizyairPromptPresetAsNew('jailbreak')">另存为</button>
+                                </div>
+                                <div class="bizyair-actions" style="margin-bottom:8px;">
+                                    <input type="file" id="bizyair-import-jailbreak-file" accept=".json,application/json" style="display:none;" onchange="window.importBizyairPromptPreset('jailbreak', this)">
+                                    <label for="bizyair-import-jailbreak-file" class="bizyair-btn" style="margin-right:0;background:#444;color:#ddd;">导入</label>
+                                    <button class="bizyair-btn" style="background:#0f766e;color:white;" onclick="window.exportBizyairPromptPreset('jailbreak')">导出</button>
+                                </div>
+                                <div id="bizyair-preset-status-jailbreak" style="font-size:12px;color:#777;margin-bottom:8px;">当前为新建模式</div>
+                                <div id="bizyair-list-jailbreak"></div>
+                            </div>
+                            <div>
+                                <div style="color:#38bdf8;font-size:13px;margin-bottom:6px;">📋 Task</div>
+                                <input type="text" id="bizyair-inp-task-name" class="bizyair-input" placeholder="预设名称">
+                                <textarea id="bizyair-inp-task-content" class="bizyair-input" rows="4" placeholder="输入 task 内容"></textarea>
+                                <div class="bizyair-actions" style="margin-bottom:8px;">
+                                    <button class="bizyair-btn bizyair-btn-secondary" onclick="window.newBizyairPromptPreset('task')">新建空白</button>
+                                    <button class="bizyair-btn bizyair-btn-primary" onclick="window.saveBizyairPromptPreset('task')">保存修改</button>
+                                    <button class="bizyair-btn" style="background:#7c3aed;color:white;" onclick="window.saveBizyairPromptPresetAsNew('task')">另存为</button>
+                                </div>
+                                <div class="bizyair-actions" style="margin-bottom:8px;">
+                                    <input type="file" id="bizyair-import-task-file" accept=".json,application/json" style="display:none;" onchange="window.importBizyairPromptPreset('task', this)">
+                                    <label for="bizyair-import-task-file" class="bizyair-btn" style="margin-right:0;background:#444;color:#ddd;">导入</label>
+                                    <button class="bizyair-btn" style="background:#0f766e;color:white;" onclick="window.exportBizyairPromptPreset('task')">导出</button>
+                                </div>
+                                <div id="bizyair-preset-status-task" style="font-size:12px;color:#777;margin-bottom:8px;">当前为新建模式</div>
+                                <div id="bizyair-list-task"></div>
+                            </div>
+                            <div>
+                                <div style="color:#f472b6;font-size:13px;margin-bottom:6px;">👤 Character</div>
+                                <input type="text" id="bizyair-inp-char-name" class="bizyair-input" placeholder="角色名称">
+                                <textarea id="bizyair-inp-char-content" class="bizyair-input" rows="4" placeholder="输入角色设定"></textarea>
+                                <div class="bizyair-actions" style="margin-bottom:8px;">
+                                    <button class="bizyair-btn bizyair-btn-secondary" onclick="window.newBizyairPromptPreset('char')">新建空白</button>
+                                    <button class="bizyair-btn bizyair-btn-primary" onclick="window.saveBizyairPromptPreset('char')">保存修改</button>
+                                    <button class="bizyair-btn" style="background:#7c3aed;color:white;" onclick="window.saveBizyairPromptPresetAsNew('char')">另存为</button>
+                                </div>
+                                <div class="bizyair-actions" style="margin-bottom:8px;">
+                                    <input type="file" id="bizyair-import-char-file" accept=".json,application/json" style="display:none;" onchange="window.importBizyairPromptPreset('char', this)">
+                                    <label for="bizyair-import-char-file" class="bizyair-btn" style="margin-right:0;background:#444;color:#ddd;">导入</label>
+                                    <button class="bizyair-btn" style="background:#0f766e;color:white;" onclick="window.exportBizyairPromptPreset('char')">导出</button>
+                                </div>
+                                <div id="bizyair-preset-status-char" style="font-size:12px;color:#777;margin-bottom:8px;">当前为新建模式</div>
+                                <div id="bizyair-list-char"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div style="padding:10px;background:#2a2a2a;border-radius:4px;">
+                        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px;">
+                            <div>
+                                <div style="color:#ddd;font-weight:bold;">Prompt Lab</div>
+                                <div style="font-size:12px;color:#777;">提取最近两条消息或手动输入剧情上下文</div>
+                            </div>
+                            <button class="bizyair-btn bizyair-btn-secondary" onclick="window.captureBizyairContext()">抓取最近两条</button>
+                        </div>
+                        <textarea id="bizyair-tag-context" class="bizyair-input" rows="5" placeholder="剧情内容...">${escapeHtml(capturedContext)}</textarea>
+                        <button id="bizyair-generate-tags-btn" class="bizyair-btn bizyair-btn-primary" style="width:100%;margin-bottom:10px;" onclick="window.generateBizyairTags()">✨ 分析并生成 Tag</button>
+                        <div id="bizyair-tag-output" style="min-height:120px;">
+                            <div style="text-align:center;color:#666;padding:20px;">暂无结果</div>
+                        </div>
+                    </div>
+                    <div class="bizyair-view-end-spacer" aria-hidden="true"></div>
                 </div>
                 
-                <div id="bizyair-view-gallery" class="bizyair-view" style="display:none;padding:15px;overflow-y:auto;max-height:calc(90vh - 100px);">
+                <div id="bizyair-view-gallery" class="bizyair-view bizyair-view-scroll" style="display:none;">
                     <div style="display:flex;gap:10px;margin-bottom:15px;">
                         <button class="bizyair-btn bizyair-btn-secondary" style="flex:1;" onclick="window.downloadAllGalleryImages()">📥 全部下载</button>
                         <button id="bizyair-edit-btn" class="bizyair-btn" style="flex:1;" onclick="window.toggleGalleryEditMode()">✏️ 编辑</button>
@@ -1288,6 +2986,7 @@
                         <button class="bizyair-btn" style="padding:6px 12px;font-size:12px;" onclick="window.toggleGalleryEditMode()">取消</button>
                     </div>
                     <div id="bizyair-gallery-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px;"></div>
+                    <div class="bizyair-view-end-spacer" aria-hidden="true"></div>
                 </div>
             </div>
         `;
@@ -1297,6 +2996,7 @@
         updateSeedControls(bizyairTemplate, imageParams);
         renderCustomTemplateList();
         updateGalleryCount();
+        renderLlmPanelState();
         
         window.switchBizyairTab = function(tab) {
             document.querySelectorAll('.bizyair-tab').forEach(t => {
@@ -1309,6 +3009,7 @@
             document.querySelector(`.bizyair-tab[data-tab="${tab}"]`).style.borderBottom = '2px solid #a855f7';
             
             document.getElementById('bizyair-view-settings').style.display = tab === 'settings' ? 'block' : 'none';
+            document.getElementById('bizyair-view-tagger').style.display = tab === 'tagger' ? 'block' : 'none';
             document.getElementById('bizyair-view-gallery').style.display = tab === 'gallery' ? 'block' : 'none';
             
             if (tab === 'gallery') {
@@ -1316,6 +3017,7 @@
             }
         };
         
+        document.getElementById("bizyair-view-tagger").style.display = "none";
         document.getElementById("bizyair-view-gallery").style.display = "none";
     }
 
@@ -1324,6 +3026,385 @@
         localStorage.setItem("bizyair_auto_gen", checked);
         showToast(checked ? "⚡ 自动生图已开启" : "⏸️ 自动生图已关闭");
     };
+
+    window.toggleQueueLimit = function(checked) {
+        queueLimitEnabled = checked;
+        localStorage.setItem("bizyair_queue_limit", checked);
+        if (!checked) {
+            if (queueDispatchTimer) {
+                clearTimeout(queueDispatchTimer);
+                queueDispatchTimer = null;
+            }
+            if (scheduledQueueDispatch?.assignedKey) {
+                releaseBizyairApiKeySlot(scheduledQueueDispatch.assignedKey);
+                slotAssignedApiKeys.delete(scheduledQueueDispatch.slotId);
+            }
+            scheduledQueueDispatch = null;
+            queuedGenerationSlots.clear();
+            pendingGenerationQueue.length = 0;
+            scanAndInjectButtons();
+            showToast("⏸️ 后台排队模式已关闭");
+            return;
+        }
+        processPendingGenerationQueue();
+        showToast("🚦 后台排队模式已开启");
+    };
+
+    window.saveBizyairLlmSettings = function() {
+        const modelEl = document.getElementById("bizyair-llm-model");
+        const statusEl = document.getElementById("bizyair-llm-model-status");
+        llmSettings = {
+            url: document.getElementById("bizyair-llm-url").value.trim(),
+            key: document.getElementById("bizyair-llm-key").value.trim(),
+            model: modelEl ? modelEl.value.trim() : llmSettings.model
+        };
+        autoTagEnabled = document.getElementById("bizyair-auto-tag").checked;
+        localStorage.setItem(BIZYAIR_AUTO_TAG_KEY, String(autoTagEnabled));
+        saveLlmSettings();
+        updateSystemPromptPreview();
+        if (statusEl) {
+            statusEl.textContent = "模型与独立 API 配置已保存";
+            statusEl.style.color = "#16a34a";
+            statusEl.dataset.preserve = "false";
+        }
+        showToast("✅ 独立 API 设置已保存");
+    };
+
+    window.fetchBizyairLlmModels = function() {
+        fetchBizyairLlmModels();
+    };
+
+    window.loadBizyairPresetToEditor = function(type, id) {
+        const item = getPromptPresetById(type, id);
+        if (!item) return;
+        const nameEl = document.getElementById(`bizyair-inp-${type}-name`);
+        const contentEl = document.getElementById(`bizyair-inp-${type}-content`);
+        if (nameEl) nameEl.value = item.name;
+        if (contentEl) contentEl.value = item.content;
+        presetEditorSelection[type] = item.id;
+        renderPromptPresetList(type);
+        updatePromptPresetEditorState(type);
+    };
+
+    window.newBizyairPromptPreset = function(type) {
+        clearPromptPresetEditor(type);
+        showToast("📝 已切换到新建模式");
+    };
+
+    window.toggleBizyairPromptPreset = function(type, id) {
+        if (type === "char") {
+            const item = promptPresets.char.find(entry => entry.id === id);
+            if (item) item.active = !item.active;
+        } else {
+            promptPresets[type].forEach(entry => {
+                entry.active = entry.id === id;
+            });
+        }
+        savePromptPresets(type);
+        renderPromptPresetList(type);
+        updateSystemPromptPreview();
+        updatePromptPresetEditorState(type);
+    };
+
+    window.deleteBizyairPromptPreset = function(type, id) {
+        if (!confirm("删除这个预设？")) return;
+        promptPresets[type] = (promptPresets[type] || []).filter(entry => entry.id !== id);
+        if (type !== "char") {
+            promptPresets[type] = ensureExclusivePresetState(type, promptPresets[type]);
+        }
+        if (presetEditorSelection[type] === id) {
+            clearPromptPresetEditor(type);
+        }
+        savePromptPresets(type);
+        renderPromptPresetList(type);
+        updateSystemPromptPreview();
+        updatePromptPresetEditorState(type);
+        showToast("🗑️ 预设已删除");
+    };
+
+    window.saveBizyairPromptPreset = function(type) {
+        const nameEl = document.getElementById(`bizyair-inp-${type}-name`);
+        const contentEl = document.getElementById(`bizyair-inp-${type}-content`);
+        const name = nameEl ? nameEl.value.trim() : "";
+        const content = contentEl ? contentEl.value.trim() : "";
+        if (!name || !content) {
+            showToast("请填写预设名称和内容");
+            return;
+        }
+
+        const selectedId = presetEditorSelection[type];
+        const selected = getPromptPresetById(type, selectedId);
+        const fallbackIdx = selected ? -1 : promptPresets[type].findIndex(entry => String(entry.name || "").trim() === name);
+        let target = selected || (fallbackIdx >= 0 ? promptPresets[type][fallbackIdx] : null);
+        const finalName = target ? buildUniquePromptPresetName(type, name, target.id) : name;
+
+        if (target) {
+            pushPromptPresetHistory(target);
+            target.name = finalName;
+            target.content = content;
+            if (type !== "char") {
+                target.active = true;
+                promptPresets[type].forEach(entry => {
+                    if (entry.id !== target.id) entry.active = false;
+                });
+            }
+        } else {
+            const created = {
+                id: Date.now() + Math.floor(Math.random() * 1000),
+                name: finalName,
+                content,
+                active: type !== "char",
+                history: []
+            };
+            if (type !== "char") {
+                promptPresets[type].forEach(entry => { entry.active = false; });
+            }
+            promptPresets[type].push(created);
+            target = created;
+        }
+
+        presetEditorSelection[type] = target.id;
+        if (nameEl) nameEl.value = target.name;
+        savePromptPresets(type);
+        renderPromptPresetList(type);
+        updateSystemPromptPreview();
+        showToast("✅ 预设已保存");
+        updatePromptPresetEditorState(type);
+    };
+
+    window.saveBizyairPromptPresetAsNew = function(type) {
+        const nameEl = document.getElementById(`bizyair-inp-${type}-name`);
+        const contentEl = document.getElementById(`bizyair-inp-${type}-content`);
+        const rawName = nameEl ? nameEl.value.trim() : "";
+        const content = contentEl ? contentEl.value.trim() : "";
+        if (!rawName || !content) {
+            showToast("请填写预设名称和内容");
+            return;
+        }
+
+        const selectedId = presetEditorSelection[type];
+        const uniqueName = buildUniquePromptPresetName(type, rawName, selectedId);
+        const source = getPromptPresetById(type, selectedId);
+        const created = {
+            id: Date.now() + Math.floor(Math.random() * 1000),
+            name: uniqueName,
+            content,
+            active: false,
+            history: source?.history ? [...source.history] : []
+        };
+        promptPresets[type].push(created);
+        presetEditorSelection[type] = created.id;
+        if (nameEl) nameEl.value = uniqueName;
+        savePromptPresets(type);
+        renderPromptPresetList(type);
+        updateSystemPromptPreview();
+        updatePromptPresetEditorState(type);
+        showToast("✅ 已另存为新预设");
+    };
+
+    window.cloneBizyairPromptPreset = function(type, id) {
+        const item = getPromptPresetById(type, id);
+        if (!item) return;
+        const cloneName = buildUniquePromptPresetName(type, `${item.name} 副本`, null);
+        const created = {
+            id: Date.now() + Math.floor(Math.random() * 1000),
+            name: cloneName,
+            content: item.content,
+            active: false,
+            history: Array.isArray(item.history) ? [...item.history] : []
+        };
+        promptPresets[type].push(created);
+        presetEditorSelection[type] = created.id;
+        const nameEl = document.getElementById(`bizyair-inp-${type}-name`);
+        const contentEl = document.getElementById(`bizyair-inp-${type}-content`);
+        if (nameEl) nameEl.value = created.name;
+        if (contentEl) contentEl.value = created.content;
+        savePromptPresets(type);
+        renderPromptPresetList(type);
+        updatePromptPresetEditorState(type);
+        showToast("📄 已复制为新预设");
+    };
+
+    window.exportBizyairPromptPreset = function(type) {
+        const selected = getPromptPresetById(type, presetEditorSelection[type]);
+        const list = selected ? [selected] : (promptPresets[type] || []);
+        if (list.length === 0) {
+            showToast("⚠️ 当前没有可导出的预设");
+            return;
+        }
+        const payload = {
+            format: "bizyair-prompt-presets",
+            created_at: new Date().toISOString(),
+            promptPresets: {
+                [type]: list
+            }
+        };
+        exportPromptPresetsAsFile(type, payload, `bizyair_${type}_presets.json`);
+        showToast(selected ? "📤 已导出当前预设" : "📤 已导出当前分类");
+    };
+
+    window.importBizyairPromptPreset = function(type, inputEl) {
+        const file = inputEl?.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (event) => {
+            try {
+                const raw = String(event.target?.result || "");
+                const parsed = JSON.parse(raw);
+                const incoming = Array.isArray(parsed)
+                    ? parsed
+                    : parsed?.promptPresets?.[type] || parsed?.[type] || [];
+                const changed = mergePromptPresetType(type, incoming);
+                if (!changed) {
+                    throw new Error("文件里没有可导入的预设");
+                }
+                showToast(`✅ 已导入 ${changed} 条预设`);
+            } catch (e) {
+                console.error("导入预设失败:", e);
+                showToast(`❌ 导入失败: ${e.message || e}`);
+            } finally {
+                inputEl.value = "";
+            }
+        };
+        reader.onerror = () => {
+            showToast("❌ 读取预设文件失败");
+            inputEl.value = "";
+        };
+        reader.readAsText(file);
+    };
+
+    window.addBizyairPromptPreset = function(type) {
+        window.saveBizyairPromptPreset(type);
+    };
+
+    window.captureBizyairContext = function() {
+        const text = captureRecentChatContext();
+        if (!text) return;
+        showToast("✨ 已抓取最近两条消息");
+    };
+
+    window.closeBizyairMagicActionModal = function() {
+        closeMagicActionModal();
+    };
+
+    window.closeBizyairCharacterBuildModal = function() {
+        closeCharacterBuildReviewModal();
+    };
+
+    window.startBizyairChatTagFlow = function() {
+        closeMagicActionModal();
+        const text = captureRecentChatContext();
+        if (!text) return;
+        capturedContext = text;
+        localStorage.setItem(BIZYAIR_CONTEXT_KEY, capturedContext);
+        updateTagContextInput();
+        generatePromptTags();
+    };
+
+    window.startBizyairCharacterBuildFlow = async function() {
+        closeMagicActionModal();
+        try {
+            const context = getSillyTavernContextSafe();
+            const currentCharacter = context && context.characterId !== undefined && context.characterId !== null
+                ? await ensureCharacterLoaded(context, context.characterId)
+                : null;
+            const characterName = currentCharacter?.name || currentCharacter?.data?.name || "未命名角色";
+            const text = await buildCharacterBuildContext();
+            if (!text) {
+                showToast("⚠️ 未获取到角色构建内容");
+                return;
+            }
+            pendingCharacterBuild = {
+                characterName,
+                sourceText: text,
+                profile: "",
+                error: "",
+                loading: true
+            };
+            openCharacterBuildReviewModal();
+            await runCharacterBuildRequest();
+        } catch (e) {
+            console.error("角色构建失败:", e);
+            showToast(`❌ 角色构建失败: ${e.message || e}`);
+        }
+    };
+
+    window.retryBizyairCharacterBuild = async function() {
+        if (!pendingCharacterBuild || pendingCharacterBuild.loading) return;
+        try {
+            await runCharacterBuildRequest();
+            showToast("🔄 已重写角色资料");
+        } catch (e) {
+            console.error("角色资料重写失败:", e);
+            showToast(`❌ 重写失败: ${e.message || e}`);
+        }
+    };
+
+    window.saveBizyairCharacterBuild = function() {
+        if (!pendingCharacterBuild || pendingCharacterBuild.loading) return;
+        const modal = document.getElementById("bizyair-character-build-modal");
+        const textEl = modal?.querySelector("[data-bizyair-build-text]");
+        const profile = textEl ? textEl.value.trim() : String(pendingCharacterBuild.profile || "").trim();
+        if (!profile) {
+            showToast("⚠️ 角色资料为空，无法保存");
+            return;
+        }
+        upsertCharacterPromptPreset(pendingCharacterBuild.characterName, profile);
+        closeCharacterBuildReviewModal();
+        showToast(`✅ 已更新角色资料：${pendingCharacterBuild.characterName}`);
+    };
+
+    window.generateBizyairTags = function() {
+        generatePromptTags();
+    };
+
+    window.importBizyairBridgeBackup = function(inputEl) {
+        const file = inputEl?.files?.[0];
+        if (!file) {
+            showToast("请选择 bridge 备份文件");
+            return;
+        }
+
+        const reader = new FileReader();
+        reader.onload = async (event) => {
+            try {
+                const raw = String(event.target?.result || "");
+                const data = JSON.parse(raw);
+                await importBridgeBackupObject(data);
+                showToast("✅ bridge 预设已导入");
+            } catch (e) {
+                console.error("导入 bridge 备份失败:", e);
+                showToast(`❌ 导入失败: ${e.message || e}`);
+            } finally {
+                inputEl.value = "";
+            }
+        };
+        reader.onerror = () => {
+            showToast("❌ 读取备份文件失败");
+            inputEl.value = "";
+        };
+        reader.readAsText(file);
+    };
+
+    window.bizyairApplyRolePrompt = function(sceneIndex) {
+        const el = document.querySelector(`textarea[data-role-prompt="${sceneIndex}"]`);
+        if (!el) return;
+        updateBizyairPositivePrompt(el.value.trim());
+        showToast("✅ 已写入正面提示词");
+    };
+
+    window.bizyairGenerateScene = async function(sceneIndex) {
+        const el = document.querySelector(`textarea[data-role-prompt="${sceneIndex}"]`);
+        if (!el) return;
+        const promptText = el.value.trim();
+        const card = el.closest(`[data-bizyair-scene="${sceneIndex}"]`);
+        const locatorText = card?.getAttribute("data-bizyair-locator") || "";
+        if (!promptText || !locatorText) return;
+        updateBizyairPositivePrompt(promptText);
+        const inserted = await insertImageTagIntoChat(locatorText, promptText);
+        showToast(inserted ? "✅ 已重新插入 image 标签" : "⚠️ 未找到定位文本");
+    };
+
 
     window.switchBizyairTemplate = function(templateId) {
         if (!getAllTemplates()[templateId]) return;
@@ -1388,11 +3469,17 @@
         bizyairTemplate = templateSelect ? normalizeTemplateId(templateSelect.value) : bizyairTemplate;
         localStorage.setItem("bizyair_template", bizyairTemplate);
 
-        bizyairApiKey = document.getElementById("bizyair-api-key").value.trim();
+        bizyairApiKey = parseBizyairApiKeys(document.getElementById("bizyair-api-key").value).join(",");
+        syncBizyairKeyPool();
         const defaultWebAppId = getTemplateDef(bizyairTemplate).defaultWebAppId;
         bizyairWebAppId = document.getElementById("bizyair-web-app-id").value.trim() || String(defaultWebAppId);
         localStorage.setItem("bizyair_api_key", bizyairApiKey);
         setWebAppIdForTemplate(bizyairTemplate, bizyairWebAppId);
+
+        const apiKeyEl = document.getElementById("bizyair-api-key");
+        if (apiKeyEl) {
+            apiKeyEl.value = bizyairApiKey;
+        }
 
         imageParams = {
             positivePrompt: document.getElementById("bizyair-pos-prompt").value,
@@ -1420,6 +3507,7 @@
         showToast("✅ 设置已保存");
         const saveHint = document.getElementById("bizyair-save-hint");
         if (saveHint) saveHint.textContent = "✅ 设置已保存";
+        processPendingGenerationQueue();
     };
 
     function checkSidebarButton() {
@@ -1442,48 +3530,6 @@
                 }
             }
         });
-    }
-
-    function injectNodeAfterText(rootElement, searchText, nodeToInject) {
-        let textMap = [];
-        let fullText = "";
-        
-        function traverse(node) {
-            if (node.nodeType === Node.TEXT_NODE) {
-                for (let i = 0; i < node.nodeValue.length; i++) {
-                    textMap.push({ node: node, offset: i, char: node.nodeValue[i] });
-                }
-                fullText += node.nodeValue;
-            } else {
-                node.childNodes.forEach(traverse);
-            }
-        }
-        
-        traverse(rootElement);
-        const idx = fullText.lastIndexOf(searchText);
-        if (idx === -1) return false;
-        
-        const endIdx = idx + searchText.length;
-        if (endIdx >= textMap.length) {
-            rootElement.appendChild(nodeToInject);
-        } else {
-            const mapEntry = textMap[endIdx - 1];
-            const targetNode = mapEntry.node;
-            const splitPoint = mapEntry.offset + 1;
-            
-            if (splitPoint < targetNode.nodeValue.length) {
-                const remainderNode = targetNode.splitText(splitPoint);
-                targetNode.parentNode.insertBefore(nodeToInject, remainderNode);
-            } else {
-                const nextSibling = targetNode.nextSibling;
-                if (nextSibling) {
-                    targetNode.parentNode.insertBefore(nodeToInject, nextSibling);
-                } else {
-                    targetNode.parentNode.appendChild(nodeToInject);
-                }
-            }
-        }
-        return true;
     }
 
     function replaceTextWithNodeAt(rootElement, startIdx, length, nodeToInject) {
@@ -1711,19 +3757,153 @@
 
     function renderGenerateButton(wrapper, slotId, description, loadingText) {
         const isGenerating = generatingSlots.has(slotId);
+        const isQueued = queuedGenerationSlots.has(slotId);
         const effectiveLoadingText = loadingText || (isGenerating ? "生成中..." : "");
         const encodedDescription = encodeURIComponent(description);
-        const clickAction = isGenerating
+        const locator = wrapper?.getAttribute("data-bizyair-locator") || "";
+        const clickAction = (isGenerating || isQueued)
             ? `window.bizyairCancelGenerate('${slotId}', this)`
             : `window.bizyairStartGenerate('${slotId}', this)`;
-        const icon = isGenerating ? '⏹️' : (effectiveLoadingText ? '⏳' : '🖼️');
+        const buttonText = isQueued ? "排队中...（点击取消）" : (effectiveLoadingText || '生成图片');
+        const icon = (isGenerating || isQueued) ? '⏹️' : (effectiveLoadingText ? '⏳' : '🖼️');
         wrapper.className = "bizyair-inject-wrapper";
         wrapper.setAttribute("data-slot-id", slotId);
         wrapper.innerHTML = `
-            <button class="bizyair-inject-btn${effectiveLoadingText ? ' loading' : ''}" data-description="${encodedDescription}" data-slot-id="${slotId}" onclick="${clickAction}">
-                <span>${icon}</span> ${effectiveLoadingText || '生成图片'}
+            <button class="bizyair-inject-btn${(effectiveLoadingText || isQueued) ? ' loading' : ''}" data-description="${encodedDescription}" data-slot-id="${slotId}" data-bizyair-locator="${encodeURIComponent(locator)}" onclick="${clickAction}">
+                <span>${icon}</span> ${buttonText}
             </button>
         `;
+    }
+
+    function dequeuePendingGeneration(slotId) {
+        const queueIndex = pendingGenerationQueue.findIndex(item => item.slotId === slotId);
+        if (queueIndex !== -1) {
+            pendingGenerationQueue.splice(queueIndex, 1);
+        }
+        if (scheduledQueueDispatch?.slotId === slotId) {
+            if (queueDispatchTimer) {
+                clearTimeout(queueDispatchTimer);
+                queueDispatchTimer = null;
+            }
+            if (scheduledQueueDispatch.assignedKey) {
+                releaseBizyairApiKeySlot(scheduledQueueDispatch.assignedKey);
+                slotAssignedApiKeys.delete(slotId);
+            }
+            scheduledQueueDispatch = null;
+        }
+        queuedGenerationSlots.delete(slotId);
+    }
+
+    function scheduleQueuedGenerationDispatch(slotId, assignedKey) {
+        if (queueDispatchTimer) return;
+
+        const now = Date.now();
+        const delay = Math.max(0, nextQueueDispatchAt - now);
+        nextQueueDispatchAt = Math.max(nextQueueDispatchAt, now) + QUEUE_DISPATCH_INTERVAL_MS;
+        scheduledQueueDispatch = { slotId, assignedKey };
+
+        queueDispatchTimer = setTimeout(() => {
+            queueDispatchTimer = null;
+            const scheduled = scheduledQueueDispatch;
+            scheduledQueueDispatch = null;
+            if (!scheduled) {
+                processPendingGenerationQueue();
+                return;
+            }
+
+            const { slotId: scheduledSlotId, assignedKey: scheduledKey } = scheduled;
+            if (!queuedGenerationSlots.has(scheduledSlotId)) {
+                if (scheduledKey) {
+                    releaseBizyairApiKeySlot(scheduledKey);
+                    slotAssignedApiKeys.delete(scheduledSlotId);
+                }
+                processPendingGenerationQueue();
+                return;
+            }
+
+            const btn = document.querySelector(`button[data-slot-id="${scheduledSlotId}"]`);
+            if (!btn || generatingSlots.has(scheduledSlotId) || getSavedGalleryItem(scheduledSlotId)) {
+                queuedGenerationSlots.delete(scheduledSlotId);
+                if (scheduledKey) {
+                    releaseBizyairApiKeySlot(scheduledKey);
+                    slotAssignedApiKeys.delete(scheduledSlotId);
+                }
+                processPendingGenerationQueue();
+                return;
+            }
+
+            queuedGenerationSlots.delete(scheduledSlotId);
+            window.bizyairStartGenerate(scheduledSlotId, btn);
+            processPendingGenerationQueue();
+        }, delay);
+    }
+
+    function processPendingGenerationQueue() {
+        if (queueDispatchTimer || scheduledQueueDispatch) return;
+
+        while (pendingGenerationQueue.length > 0) {
+            if (hasMultipleBizyairKeys()) {
+                const availableKey = acquireBizyairApiKeySlot();
+                if (!availableKey) return;
+
+                const next = pendingGenerationQueue.shift();
+                if (!next) {
+                    releaseBizyairApiKeySlot(availableKey);
+                    return;
+                }
+
+                const { slotId } = next;
+                if (generatingSlots.has(slotId) || getSavedGalleryItem(slotId) || !queuedGenerationSlots.has(slotId)) {
+                    releaseBizyairApiKeySlot(availableKey);
+                    continue;
+                }
+
+                slotAssignedApiKeys.set(slotId, availableKey);
+                scheduleQueuedGenerationDispatch(slotId, availableKey);
+                return;
+            }
+
+            if (!shouldUseSingleKeyQueueLimit()) return;
+            if (generatingSlots.size >= MAX_BACKGROUND_QUEUE_ACTIVE) return;
+
+            const next = pendingGenerationQueue.shift();
+            if (!next) continue;
+
+            const { slotId } = next;
+            if (generatingSlots.has(slotId) || getSavedGalleryItem(slotId) || !queuedGenerationSlots.has(slotId)) {
+                continue;
+            }
+
+            scheduleQueuedGenerationDispatch(slotId, null);
+            return;
+        }
+    }
+
+    function enqueueGenerationRequest(slotId, description, wrapper) {
+        if (generatingSlots.has(slotId) || queuedGenerationSlots.has(slotId)) return true;
+
+        if (hasMultipleBizyairKeys()) {
+            if (slotAssignedApiKeys.has(slotId)) return false;
+            const reservedKey = acquireBizyairApiKeySlot();
+            if (reservedKey) {
+                slotAssignedApiKeys.set(slotId, reservedKey);
+                return false;
+            }
+        } else {
+            if (!shouldUseSingleKeyQueueLimit()) return false;
+            if (generatingSlots.size < MAX_BACKGROUND_QUEUE_ACTIVE) return false;
+        }
+
+        pendingGenerationQueue.push({
+            slotId,
+            description,
+            timestamp: Date.now()
+        });
+        queuedGenerationSlots.add(slotId);
+        if (wrapper) {
+            renderGenerateButton(wrapper, slotId, description);
+        }
+        return true;
     }
 
     function isAbortError(error) {
@@ -1758,6 +3938,28 @@
         });
     }
 
+    async function waitForBizyairCreateSlot(signal) {
+        const previous = bizyairCreateDispatchChain.catch(() => {});
+        let releaseChain = null;
+        bizyairCreateDispatchChain = new Promise(resolve => {
+            releaseChain = resolve;
+        });
+
+        try {
+            await previous;
+            const now = Date.now();
+            const waitMs = Math.max(0, nextBizyairCreateAt - now);
+            nextBizyairCreateAt = Math.max(nextBizyairCreateAt, now) + QUEUE_DISPATCH_INTERVAL_MS;
+            if (waitMs > 0) {
+                await delayWithAbort(waitMs, signal);
+            }
+        } finally {
+            if (releaseChain) {
+                releaseChain();
+            }
+        }
+    }
+
     function bindResultImageEvents(resultWrapper) {
         if (!resultWrapper) return;
 
@@ -1783,10 +3985,11 @@
 
     function renderImageResult(wrapper, slotId, description, imageUrl) {
         const encodedDescription = encodeURIComponent(description);
+        const locator = wrapper?.getAttribute("data-bizyair-locator") || "";
         wrapper.className = "bizyair-inject-wrapper";
         wrapper.setAttribute("data-slot-id", slotId);
         wrapper.innerHTML = `
-            <div class="bizyair-result-wrapper" data-slot-id="${slotId}" data-description="${encodedDescription}">
+            <div class="bizyair-result-wrapper" data-slot-id="${slotId}" data-description="${encodedDescription}" data-bizyair-locator="${encodeURIComponent(locator)}">
                 <img src="${imageUrl}" class="bizyair-result-img">
                 <div class="bizyair-prompt-display" style="font-size:11px;color:#888;margin-top:4px;">单击查看大图，双击重新生成</div>
             </div>
@@ -1800,6 +4003,9 @@
             const slotId = wrapper.dataset.slotId;
             const savedItem = getSavedGalleryItem(slotId);
             if (!savedItem) return;
+            if (savedItem.locator && !wrapper.getAttribute("data-bizyair-locator")) {
+                wrapper.setAttribute("data-bizyair-locator", savedItem.locator);
+            }
 
             const currentImg = wrapper.querySelector('.bizyair-result-img');
             const resultWrapper = wrapper.querySelector('.bizyair-result-wrapper');
@@ -1824,6 +4030,7 @@
         if (messages.length === 0) return;
 
         syncSavedImagesToWrappers();
+        restoreLocatorImages();
 
         messages.forEach((messageEl, messageIndex) => {
             const existingTags = messageEl.querySelectorAll('[data-bizyair-tag]');
@@ -1882,6 +4089,8 @@
                         if (!currentImg || currentImg.src !== savedItem.url) {
                             renderImageResult(existingWrapper, slotId, current.description, savedItem.url);
                         }
+                    } else if (queuedGenerationSlots.has(slotId)) {
+                        renderGenerateButton(existingWrapper, slotId, current.description);
                     } else if (generatingSlots.has(slotId)) {
                         renderGenerateButton(existingWrapper, slotId, current.description, "生成中...");
                     }
@@ -1895,6 +4104,8 @@
 
                 if (savedItem) {
                     renderImageResult(wrapper, slotId, current.description, savedItem.url);
+                } else if (queuedGenerationSlots.has(slotId)) {
+                    renderGenerateButton(wrapper, slotId, current.description);
                 } else if (generatingSlots.has(slotId)) {
                     renderGenerateButton(wrapper, slotId, current.description, "生成中...");
                 } else {
@@ -1906,12 +4117,12 @@
 
                 processedTags.add(tagKey);
 
-                if (autoGenEnabled && !savedItem && !generatingSlots.has(slotId) && !autoGenScheduledSlots.has(slotId) && !autoGenTriggeredSlots.has(slotId)) {
+                if (autoGenEnabled && !savedItem && !generatingSlots.has(slotId) && !queuedGenerationSlots.has(slotId) && !autoGenScheduledSlots.has(slotId) && !autoGenTriggeredSlots.has(slotId)) {
                     autoGenScheduledSlots.add(slotId);
                     autoGenTriggeredSlots.add(slotId);
                     setTimeout(() => {
                         autoGenScheduledSlots.delete(slotId);
-                        if (!autoGenEnabled || generatingSlots.has(slotId) || getSavedGalleryItem(slotId)) return;
+                        if (!autoGenEnabled || generatingSlots.has(slotId) || queuedGenerationSlots.has(slotId) || getSavedGalleryItem(slotId)) return;
                         const autoBtn = document.querySelector(`button[data-slot-id="${slotId}"]`);
                         if (!autoBtn) {
                             autoGenTriggeredSlots.delete(slotId);
@@ -1947,51 +4158,93 @@
         const btn = explicitBtn || document.querySelector(`button[data-slot-id="${slotId}"]`);
         if (!btn) return;
 
+        const description = btn.dataset.description ? decodeURIComponent(btn.dataset.description) : "";
+        const wrapper = btn.closest('.bizyair-inject-wrapper');
+
+        if (queuedGenerationSlots.has(slotId)) {
+            return;
+        }
+
         if (generatingSlots.has(slotId)) {
             window.bizyairCancelGenerate(slotId, btn);
             return;
         }
 
+        if (enqueueGenerationRequest(slotId, description, wrapper)) {
+            return;
+        }
+
         autoGenScheduledSlots.delete(slotId);
+        dequeuePendingGeneration(slotId);
+        if (hasMultipleBizyairKeys() && !slotAssignedApiKeys.has(slotId)) {
+            const assignedKey = acquireBizyairApiKeySlot();
+            if (!assignedKey) {
+                enqueueGenerationRequest(slotId, description, wrapper);
+                return;
+            }
+            slotAssignedApiKeys.set(slotId, assignedKey);
+        }
         generatingSlots.add(slotId);
         const controller = new AbortController();
         slotAbortControllers.set(slotId, controller);
-        
-        const description = btn.dataset.description ? decodeURIComponent(btn.dataset.description) : "";
-        const wrapper = btn.closest('.bizyair-inject-wrapper');
+
         if (wrapper) {
             renderGenerateButton(wrapper, slotId, description, "生成中...（点击取消）");
         }
         
-        autoGenerateImage(slotId, description, controller.signal);
+        autoGenerateImage(slotId, description, controller.signal, slotAssignedApiKeys.get(slotId) || bizyairApiKeys[0] || bizyairApiKey);
     }
 
     window.bizyairCancelGenerate = function(slotId, explicitBtn) {
+        const btn = explicitBtn || document.querySelector(`button[data-slot-id="${slotId}"]`);
+        const description = btn?.dataset?.description ? decodeURIComponent(btn.dataset.description) : "";
+        const wrapper = btn?.closest('.bizyair-inject-wrapper')
+            || document.querySelector(`.bizyair-inject-wrapper[data-slot-id="${slotId}"]`);
+
+        if (queuedGenerationSlots.has(slotId)) {
+            dequeuePendingGeneration(slotId);
+            const assignedKey = slotAssignedApiKeys.get(slotId);
+            if (assignedKey) {
+                releaseBizyairApiKeySlot(assignedKey);
+                slotAssignedApiKeys.delete(slotId);
+            }
+            autoGenScheduledSlots.delete(slotId);
+            if (wrapper) {
+                renderGenerateButton(wrapper, slotId, description);
+            }
+            showToast("⏹️ 已取消排队");
+            return;
+        }
+
         const controller = slotAbortControllers.get(slotId);
         if (controller && !controller.signal.aborted) {
             controller.abort();
         }
 
-        const btn = explicitBtn || document.querySelector(`button[data-slot-id="${slotId}"]`);
-        if (btn) {
-            btn.innerHTML = `<span>⏹️</span> 已取消`;
-            btn.classList.remove("loading");
+        slotAbortControllers.delete(slotId);
+        generatingSlots.delete(slotId);
+        autoGenScheduledSlots.delete(slotId);
+
+        if (wrapper) {
+            renderGenerateButton(wrapper, slotId, description);
         }
 
         showToast("⏹️ 已取消生成");
+        processPendingGenerationQueue();
     }
 
-    async function autoGenerateImage(slotId, description, signal) {
+    async function autoGenerateImage(slotId, description, signal, apiKey) {
         const templateId = bizyairTemplate;
         let wasCancelled = false;
         
         try {
-            const result = await generateImage(description, templateId, signal);
+            const result = await generateImage(description, templateId, signal, apiKey);
             console.log("BizyAir result:", result);
             
             if (result && result.outputs && Array.isArray(result.outputs) && result.outputs.length > 0) {
                 const imageUrl = getFinalImage(result.outputs, templateId);
                 if (imageUrl) {
+                    if (apiKey) markBizyairApiKeySuccess(apiKey);
                     showImageResult(slotId, imageUrl);
                 } else {
                     throw new Error("无法获取图片地址");
@@ -2001,7 +4254,7 @@
                 if (wrapper) {
                     renderGenerateButton(wrapper, slotId, description, "等待图片...（点击取消）");
                 }
-                await pollForResult(result.request_id, slotId, templateId, signal, description);
+                await pollForResult(result.request_id, slotId, templateId, signal, description, apiKey);
             } else {
                 console.log("BizyAir response:", result);
                 throw new Error("未获取到图片地址");
@@ -2011,6 +4264,9 @@
                 wasCancelled = true;
             }
             console.error("BizyAir Error:", error);
+            if (!wasCancelled && apiKey && hasMultipleBizyairKeys()) {
+                markBizyairApiKeyFailure(apiKey);
+            }
             if (!wasCancelled) {
                 const btn = document.querySelector(`button[data-slot-id="${slotId}"]`);
                 if (btn) {
@@ -2023,6 +4279,11 @@
             slotAbortControllers.delete(slotId);
             generatingSlots.delete(slotId);
             autoGenScheduledSlots.delete(slotId);
+            const assignedKey = slotAssignedApiKeys.get(slotId);
+            if (assignedKey) {
+                releaseBizyairApiKeySlot(assignedKey);
+                slotAssignedApiKeys.delete(slotId);
+            }
 
             if (wasCancelled) {
                 const wrapper = document.querySelector(`.bizyair-inject-wrapper[data-slot-id="${slotId}"]`);
@@ -2030,6 +4291,7 @@
                     renderGenerateButton(wrapper, slotId, description);
                 }
             }
+            processPendingGenerationQueue();
         }
     }
 
@@ -2047,8 +4309,19 @@
             description = decodeURIComponent(resultWrapper.dataset.description);
         }
 
+        let locator = wrapper.getAttribute("data-bizyair-locator") || "";
+        if (!locator && button && button.dataset.bizyairLocator) {
+            locator = decodeURIComponent(button.dataset.bizyairLocator);
+        }
+        if (!locator && resultWrapper && resultWrapper.dataset.bizyairLocator) {
+            locator = decodeURIComponent(resultWrapper.dataset.bizyairLocator);
+        }
+
         renderImageResult(wrapper, slotId, description, imageUrl);
-        saveToGallery(imageUrl, description, slotId);
+        if (locator) {
+            wrapper.setAttribute("data-bizyair-locator", locator);
+        }
+        saveToGallery(imageUrl, description, slotId, locator || null);
 
         showToast("✅ 图片生成成功");
     }
@@ -2230,7 +4503,7 @@
         });
     }
     
-    async function saveToGallery(url, prompt, slotId) {
+    async function saveToGallery(url, prompt, slotId, locator = null) {
         const uniqueSuffix = Math.random().toString(36).slice(2, 8);
         const itemId = slotId
             ? `${slotId}_${Date.now()}_${uniqueSuffix}`
@@ -2238,6 +4511,7 @@
         const previewItem = {
             id: itemId,
             slotId: slotId,
+            locator: locator,
             url: url,
             thumbUrl: url,
             prompt: prompt,
@@ -2267,6 +4541,7 @@
             const item = {
                 id: itemId,
                 slotId: slotId,
+                locator: locator,
                 url: base64,
                 thumbUrl: thumbUrl || base64,
                 prompt: prompt,
@@ -2367,7 +4642,7 @@
         }
     }
 
-    async function pollForResult(taskId, slotId, templateId, signal, description) {
+    async function pollForResult(taskId, slotId, templateId, signal, description, apiKey) {
         const btn = document.querySelector(`button[data-slot-id="${slotId}"]`);
         const maxAttempts = 60;
         let attempts = 0;
@@ -2378,7 +4653,7 @@
             try {
                 const res = await fetch(`https://api.bizyair.cn/w/v1/webapp/task/openapi/query?task_id=${taskId}`, {
                     headers: {
-                        'Authorization': `Bearer ${bizyairApiKey}`
+                        'Authorization': `Bearer ${apiKey || bizyairApiKeys[0] || bizyairApiKey}`
                     },
                     signal
                 });
@@ -2389,6 +4664,7 @@
                 if (data.status === 'Success' && data.outputs && Array.isArray(data.outputs) && data.outputs.length > 0) {
                     const imageUrl = getFinalImage(data.outputs, templateId);
                     if (!imageUrl) continue;
+                    if (apiKey) markBizyairApiKeySuccess(apiKey);
                     showImageResult(slotId, imageUrl);
                     return;
                 } else if (data.status === 'failed') {
@@ -2456,7 +4732,7 @@
         return outputs[safeIndex].object_url;
     }
 
-    async function generateImage(description, templateId, signal) {
+    async function generateImage(description, templateId, signal, apiKey) {
         const activeTemplate = normalizeTemplateId(templateId || bizyairTemplate);
         const stored = getStoredParams(activeTemplate);
         const built = getCurrentParams(stored, activeTemplate);
@@ -2491,12 +4767,14 @@
         const webAppId = Number.isFinite(parsedWebAppId)
             ? parsedWebAppId
             : getTemplateDef(activeTemplate).defaultWebAppId;
+
+        await waitForBizyairCreateSlot(signal);
         
         const response = await fetch('https://api.bizyair.cn/w/v1/webapp/task/openapi/create', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'Authorization': `Bearer ${bizyairApiKey}`
+                'Authorization': `Bearer ${apiKey || bizyairApiKeys[0] || bizyairApiKey}`
             },
             signal,
             body: JSON.stringify({
@@ -2509,7 +4787,7 @@
         const result = await response.json();
         
         if (!response.ok) {
-            throw new Error(result.message || "API 请求失败");
+            throw new Error(result.message || result.error || "API 请求失败");
         }
         
         return result;
@@ -2897,6 +5175,33 @@
         showToast("🗑️ 画廊已清空");
     }
 
+    function initMagicWandTrigger() {
+        const trigger = document.getElementById("extensionsMenuButton");
+        if (!trigger || trigger.dataset.bizyairMagicBound === "true") return;
+
+        let lastTouchAt = 0;
+
+        trigger.addEventListener("dblclick", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            openMagicActionModal();
+        });
+
+        trigger.addEventListener("touchend", (event) => {
+            const now = Date.now();
+            if ((now - lastTouchAt) <= 500) {
+                lastTouchAt = 0;
+                event.preventDefault();
+                event.stopPropagation();
+                openMagicActionModal();
+                return;
+            }
+            lastTouchAt = now;
+        }, { passive: false });
+
+        trigger.dataset.bizyairMagicBound = "true";
+    }
+
     function init() {
         injectStyles();
         createToast();
@@ -2910,10 +5215,15 @@
             });
         });
         
-        setInterval(checkSidebarButton, 1000);
+        setInterval(() => {
+            checkSidebarButton();
+            initMagicWandTrigger();
+        }, 1000);
         
         checkSidebarButton();
         initObserver();
+        initLocatorRestoreObserver();
+        initMagicWandTrigger();
         
         console.log("BizyAir Image Generator 插件已加载");
     }
