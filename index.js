@@ -176,6 +176,7 @@
     const BIZYAIR_PRESET_PREFIX = "bizyair_prompt_";
     const BIZYAIR_AUTO_TAG_KEY = "bizyair_auto_tag";
     const BIZYAIR_CONTEXT_KEY = "bizyair_tag_context";
+    const BIZYAIR_AUTO_TAG_AFTER_MESSAGE_KEY = "bizyair_auto_tag_after_message";
 
     function deepClone(value) {
         return JSON.parse(JSON.stringify(value));
@@ -958,6 +959,7 @@
     let autoGenEnabled = localStorage.getItem("bizyair_auto_gen") === "true";
     let queueLimitEnabled = localStorage.getItem("bizyair_queue_limit") === "true";
     let autoTagEnabled = localStorage.getItem(BIZYAIR_AUTO_TAG_KEY) === "true";
+    let autoTagAfterMessageEnabled = localStorage.getItem(BIZYAIR_AUTO_TAG_AFTER_MESSAGE_KEY) === "true";
     let capturedContext = localStorage.getItem(BIZYAIR_CONTEXT_KEY) || "";
     let llmSettings = {
         url: localStorage.getItem(BIZYAIR_LLM_URL_KEY) || "https://api.openai.com/v1",
@@ -978,6 +980,12 @@
     let messageObserver = null;
     let scanHeartbeatTimer = null;
     let restoreObserver = null;
+    let autoTagListenerBound = false;
+    let autoTagInFlight = false;
+    let autoTagPendingMessageId = null;
+    const autoTagProcessedMessageIds = new Set();
+    let llmAbortController = null;
+    let llmInFlightLabel = "";
     let restoreTimer = null;
     let galleryData = [];
     const generatingSlots = new Set();
@@ -1779,11 +1787,13 @@
         const keyInput = document.getElementById("bizyair-llm-key");
         const modelInput = document.getElementById("bizyair-llm-model");
         const autoTagInput = document.getElementById("bizyair-auto-tag");
+        const autoTagAfterMessageInput = document.getElementById("bizyair-auto-tag-after-message");
         const statusEl = document.getElementById("bizyair-llm-model-status");
         if (urlInput) urlInput.value = llmSettings.url;
         if (keyInput) keyInput.value = llmSettings.key;
         if (modelInput) modelInput.value = llmSettings.model;
         if (autoTagInput) autoTagInput.checked = autoTagEnabled;
+        if (autoTagAfterMessageInput) autoTagAfterMessageInput.checked = autoTagAfterMessageEnabled;
         if (statusEl && !statusEl.dataset.preserve) {
             statusEl.textContent = "";
             statusEl.style.color = "#777";
@@ -2235,6 +2245,65 @@
         return capturedContext;
     }
 
+    function shouldAutoTagAfterMessage(messageId) {
+        if (!autoTagAfterMessageEnabled) return false;
+        if (!Number.isInteger(messageId) || messageId < 0) return false;
+        if (autoTagProcessedMessageIds.has(messageId)) return false;
+        if (!llmSettings.key) return false;
+
+        const context = getSillyTavernContextSafe();
+        const message = context?.chat?.[messageId];
+        if (!message || !String(message.mes || "").trim()) return false;
+        return true;
+    }
+
+    async function triggerAutoTagForMessage(messageId) {
+        if (!shouldAutoTagAfterMessage(messageId)) return;
+
+        autoTagProcessedMessageIds.add(messageId);
+        if (autoTagInFlight) {
+            autoTagPendingMessageId = messageId;
+            return;
+        }
+
+        autoTagInFlight = true;
+        try {
+            const text = captureRecentChatContext();
+            if (!text) return;
+            await generatePromptTags();
+        } catch (e) {
+            console.error("自动触发独立 API 生图失败:", e);
+        } finally {
+            autoTagInFlight = false;
+            if (autoTagPendingMessageId !== null) {
+                const pendingId = autoTagPendingMessageId;
+                autoTagPendingMessageId = null;
+                if (shouldAutoTagAfterMessage(pendingId)) {
+                    triggerAutoTagForMessage(pendingId);
+                }
+            }
+        }
+    }
+
+    function bindAutoTagAfterMessageListener() {
+        if (autoTagListenerBound) return;
+        const eventSource = window.eventSource;
+        const eventTypes = window.event_types;
+        if (!eventSource || !eventTypes?.CHARACTER_MESSAGE_RENDERED) return;
+
+        eventSource.on(eventTypes.CHARACTER_MESSAGE_RENDERED, (messageId) => {
+            triggerAutoTagForMessage(messageId);
+        });
+        if (eventTypes.CHAT_CHANGED) {
+            eventSource.on(eventTypes.CHAT_CHANGED, () => {
+                autoTagProcessedMessageIds.clear();
+                autoTagPendingMessageId = null;
+                autoTagInFlight = false;
+            });
+        }
+        autoTagListenerBound = true;
+    }
+
     function injectTagTriggerIntoChat(locatorText, promptText) {
         if (!locatorText || !promptText) return null;
         const messages = document.querySelectorAll(".mes_text");
@@ -2370,7 +2439,40 @@
         return `${requestLabel || "llm"} 空回复 | finish_reason=${finishReason} | system_len=${systemLength} | user_len=${userLength} | preview=${preview}`;
     }
 
-    async function requestBizyairLlm(systemPrompt, userPrompt, requestLabel = "llm") {
+    function startBizyairLlmRequest(requestLabel) {
+        if (llmAbortController) {
+            try {
+                llmAbortController.abort();
+            } catch (e) {
+                console.warn("取消上一次独立 API 请求失败:", e);
+            }
+        }
+        llmAbortController = new AbortController();
+        llmInFlightLabel = requestLabel || "llm";
+        return llmAbortController;
+    }
+
+    function finishBizyairLlmRequest(controller) {
+        if (controller && controller === llmAbortController) {
+            llmAbortController = null;
+            llmInFlightLabel = "";
+        }
+    }
+
+    function cancelBizyairLlmRequest() {
+        if (!llmAbortController) return false;
+        try {
+            llmAbortController.abort();
+        } catch (e) {
+            console.warn("取消独立 API 请求失败:", e);
+        } finally {
+            llmAbortController = null;
+            llmInFlightLabel = "";
+        }
+        return true;
+    }
+
+    async function requestBizyairLlm(systemPrompt, userPrompt, requestLabel = "llm", signal = null) {
         if (!userPrompt) {
             throw new Error("缺少输入内容");
         }
@@ -2394,7 +2496,8 @@
                 "Content-Type": "application/json",
                 "Authorization": `Bearer ${llmSettings.key}`
             },
-            body: JSON.stringify(payload)
+            body: JSON.stringify(payload),
+            signal: signal || undefined
         });
         const rawText = await response.text();
         if (!response.ok) {
@@ -2509,8 +2612,9 @@
             output.innerHTML = `<div style="text-align:center;padding:20px;color:#777;">Thinking...</div>`;
         }
 
+        const controller = startBizyairLlmRequest("chat_tags");
         try {
-            const content = await requestBizyairLlm(getSystemPromptForMode("chat_tags"), contextText, "chat_tags");
+            const content = await requestBizyairLlm(getSystemPromptForMode("chat_tags"), contextText, "chat_tags", controller.signal);
             await parseAndRenderTagOutput(content);
         } catch (e) {
             console.error("独立 API 生成失败:", e);
@@ -2519,6 +2623,7 @@
             }
             showToast("❌ 独立 API 生成失败");
         } finally {
+            finishBizyairLlmRequest(controller);
             if (button) {
                 button.disabled = false;
                 button.textContent = "✨ 分析并生成 Tag";
@@ -2646,8 +2751,9 @@
         pendingCharacterBuild.error = "";
         renderCharacterBuildReviewState();
 
+        const controller = startBizyairLlmRequest("character_build");
         try {
-            const content = await requestBizyairLlm(getSystemPromptForMode("character_build"), pendingCharacterBuild.sourceText, "character_build");
+            const content = await requestBizyairLlm(getSystemPromptForMode("character_build"), pendingCharacterBuild.sourceText, "character_build", controller.signal);
             const profile = parseCharacterBuildOutput(content);
             if (!String(profile || "").trim()) {
                 throw new Error("角色构建结果为空");
@@ -2658,6 +2764,7 @@
             pendingCharacterBuild.error = e.message || String(e);
             throw e;
         } finally {
+            finishBizyairLlmRequest(controller);
             pendingCharacterBuild.loading = false;
             renderCharacterBuildReviewState();
         }
@@ -2742,6 +2849,10 @@
                         <label style="display:flex; align-items:center; gap: 10px; cursor: pointer;">
                             <input type="checkbox" id="bizyair-auto-gen" ${autoGenEnabled ? 'checked' : ''} onchange="window.toggleAutoGen(this.checked)">
                             <span style="color:#ddd; font-size:13px;">检测到 image## 时自动生成图片</span>
+                        </label>
+                        <label style="display:flex; align-items:center; gap: 10px; cursor: pointer; margin-top:8px;">
+                            <input type="checkbox" id="bizyair-auto-tag-after-message" ${autoTagAfterMessageEnabled ? 'checked' : ''} onchange="window.toggleAutoTagAfterMessage(this.checked)">
+                            <span style="color:#ddd; font-size:13px;">正文生成后自动触发独立 API 生图</span>
                         </label>
                         <label style="display:flex; align-items:center; gap: 10px; cursor: pointer; margin-top:8px;">
                             <input type="checkbox" id="bizyair-queue-limit" ${queueLimitEnabled ? 'checked' : ''} onchange="window.toggleQueueLimit(this.checked)">
@@ -3025,6 +3136,12 @@
         autoGenEnabled = checked;
         localStorage.setItem("bizyair_auto_gen", checked);
         showToast(checked ? "⚡ 自动生图已开启" : "⏸️ 自动生图已关闭");
+    };
+
+    window.toggleAutoTagAfterMessage = function(checked) {
+        autoTagAfterMessageEnabled = checked;
+        localStorage.setItem(BIZYAIR_AUTO_TAG_AFTER_MESSAGE_KEY, String(checked));
+        showToast(checked ? "✅ 正文后自动触发已开启" : "⏸️ 正文后自动触发已关闭");
     };
 
     window.toggleQueueLimit = function(checked) {
@@ -5184,6 +5301,13 @@
         trigger.addEventListener("dblclick", (event) => {
             event.preventDefault();
             event.stopPropagation();
+            if (llmAbortController) {
+                const canceled = cancelBizyairLlmRequest();
+                if (canceled) {
+                    showToast(`已中断独立 API 生成${llmInFlightLabel ? ` (${llmInFlightLabel})` : ""}`);
+                    return;
+                }
+            }
             openMagicActionModal();
         });
 
@@ -5193,6 +5317,13 @@
                 lastTouchAt = 0;
                 event.preventDefault();
                 event.stopPropagation();
+                if (llmAbortController) {
+                    const canceled = cancelBizyairLlmRequest();
+                    if (canceled) {
+                        showToast(`已中断独立 API 生成${llmInFlightLabel ? ` (${llmInFlightLabel})` : ""}`);
+                        return;
+                    }
+                }
                 openMagicActionModal();
                 return;
             }
@@ -5218,12 +5349,14 @@
         setInterval(() => {
             checkSidebarButton();
             initMagicWandTrigger();
+            bindAutoTagAfterMessageListener();
         }, 1000);
         
         checkSidebarButton();
         initObserver();
         initLocatorRestoreObserver();
         initMagicWandTrigger();
+        bindAutoTagAfterMessageListener();
         
         console.log("BizyAir Image Generator 插件已加载");
     }
