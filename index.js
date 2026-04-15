@@ -1193,10 +1193,15 @@
                 background: transparent;
                 font-family: var(--bz-font);
                 box-sizing: border-box;
+                overflow: hidden;
+            }
+            #bizyair-settings-modal:not([open]) {
+                display: none;
+            }
+            #bizyair-settings-modal[open] {
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                overflow: hidden;
             }
             #bizyair-settings-modal::backdrop {
                 background: var(--bz-bg-overlay);
@@ -1216,6 +1221,12 @@
                 flex-direction: column;
                 color: var(--bz-text);
                 font-family: var(--bz-font);
+            }
+            #bizyair-settings-modal .bizyair-modal-shell {
+                width: min(960px, calc(100vw - 48px));
+                max-width: 960px;
+                height: min(88vh, 860px);
+                max-height: min(88vh, 860px);
             }
 
             /* ===== Modal Header ===== */
@@ -1587,11 +1598,16 @@
                 padding: 16px;
                 border: none;
                 background: transparent;
+                box-sizing: border-box;
+                overflow: hidden;
+            }
+            .bizyair-overlay:not([open]) {
+                display: none;
+            }
+            .bizyair-overlay[open] {
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                box-sizing: border-box;
-                overflow: hidden;
             }
             .bizyair-overlay::backdrop {
                 background: var(--bz-bg-overlay);
@@ -1621,11 +1637,16 @@
                 padding: 0;
                 border: none;
                 background: rgba(0,0,0,0.95);
+                cursor: pointer;
+                box-sizing: border-box;
+            }
+            #bizyair-gallery:not([open]) {
+                display: none;
+            }
+            #bizyair-gallery[open] {
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                cursor: pointer;
-                box-sizing: border-box;
             }
             #bizyair-gallery::backdrop {
                 background: transparent;
@@ -3995,7 +4016,8 @@
                     btn.innerHTML = `<span style="margin-right:0.5rem;">🖼️</span><span>BizyAir</span>`;
                     btn.onclick = (e) => {
                         e.stopPropagation();
-                        document.getElementById("bizyair-settings-modal").showModal();
+                        const modal = document.getElementById("bizyair-settings-modal");
+                        if (modal && !modal.open) modal.showModal();
                     };
                     el.parentElement.insertBefore(btn, el);
                 }
