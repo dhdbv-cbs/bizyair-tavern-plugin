@@ -177,6 +177,7 @@
     const BIZYAIR_AUTO_TAG_KEY = "bizyair_auto_tag";
     const BIZYAIR_CONTEXT_KEY = "bizyair_tag_context";
     const BIZYAIR_AUTO_TAG_AFTER_MESSAGE_KEY = "bizyair_auto_tag_after_message";
+    const BIZYAIR_CONTEXT_REGEX_KEY = "bizyair_context_regex";
 
     function deepClone(value) {
         return JSON.parse(JSON.stringify(value));
@@ -960,6 +961,7 @@
     let queueLimitEnabled = localStorage.getItem("bizyair_queue_limit") === "true";
     let autoTagEnabled = localStorage.getItem(BIZYAIR_AUTO_TAG_KEY) === "true";
     let autoTagAfterMessageEnabled = localStorage.getItem(BIZYAIR_AUTO_TAG_AFTER_MESSAGE_KEY) === "true";
+    let contextRegexRules = localStorage.getItem(BIZYAIR_CONTEXT_REGEX_KEY) || "";
     let capturedContext = localStorage.getItem(BIZYAIR_CONTEXT_KEY) || "";
     let llmSettings = {
         url: localStorage.getItem(BIZYAIR_LLM_URL_KEY) || "https://api.openai.com/v1",
@@ -1122,6 +1124,299 @@
         const style = document.createElement("style");
         style.id = styleId;
         style.textContent = `
+            /* ===== Design Tokens ===== */
+            :root {
+                --bz-bg-overlay: rgba(0,0,0,0.65);
+                --bz-bg-modal: #161618;
+                --bz-bg-card: #1e1e22;
+                --bz-bg-input: #26262b;
+                --bz-bg-hover: #2e2e34;
+                --bz-border: #333338;
+                --bz-border-focus: #8b5cf6;
+                --bz-accent: #8b5cf6;
+                --bz-accent-light: #a78bfa;
+                --bz-accent-glow: rgba(139,92,246,0.15);
+                --bz-danger: #ef4444;
+                --bz-success: #10b981;
+                --bz-warning: #f59e0b;
+                --bz-info: #38bdf8;
+                --bz-text: #e2e2e8;
+                --bz-text-muted: #9898a4;
+                --bz-text-dim: #6b6b78;
+                --bz-radius-sm: 6px;
+                --bz-radius-md: 10px;
+                --bz-radius-lg: 14px;
+                --bz-radius-pill: 20px;
+                --bz-font: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+                --bz-transition: 0.2s ease;
+            }
+
+            /* ===== Toast ===== */
+            #bizyair-toast {
+                position: fixed;
+                top: 20px;
+                left: 50%;
+                transform: translateX(-50%) translateY(-8px);
+                background: var(--bz-bg-card);
+                color: var(--bz-text);
+                border: 1px solid var(--bz-border);
+                padding: 10px 22px;
+                border-radius: var(--bz-radius-pill);
+                font-size: 13px;
+                font-weight: 600;
+                z-index: 10000000;
+                box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+                opacity: 0;
+                transition: opacity 0.3s, transform 0.3s;
+                pointer-events: none;
+                max-width: calc(100vw - 40px);
+                text-align: center;
+            }
+            #bizyair-toast.show {
+                opacity: 1;
+                transform: translateX(-50%) translateY(0);
+            }
+
+            /* ===== Settings Modal Overlay ===== */
+            #bizyair-settings-modal {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                max-width: 100%;
+                max-height: 100%;
+                margin: 0;
+                padding: 16px;
+                border: none;
+                z-index: 99999;
+                background: transparent;
+                font-family: var(--bz-font);
+                box-sizing: border-box;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                overflow: hidden;
+            }
+            #bizyair-settings-modal::backdrop {
+                background: var(--bz-bg-overlay);
+            }
+
+            /* ===== Modal Shell ===== */
+            .bizyair-modal-shell {
+                width: min(560px, calc(100vw - 32px));
+                max-width: 560px;
+                max-height: min(92vh, 860px);
+                background: var(--bz-bg-modal);
+                border: 1px solid var(--bz-border);
+                border-radius: var(--bz-radius-lg);
+                box-shadow: 0 24px 80px rgba(0,0,0,0.5);
+                overflow: hidden;
+                display: flex;
+                flex-direction: column;
+                color: var(--bz-text);
+                font-family: var(--bz-font);
+            }
+
+            /* ===== Modal Header ===== */
+            .bizyair-modal-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 16px 18px;
+                border-bottom: 1px solid var(--bz-border);
+                flex-shrink: 0;
+            }
+            .bizyair-modal-header .bizyair-title {
+                font-size: 16px;
+                font-weight: 700;
+                color: var(--bz-text);
+            }
+            .bizyair-modal-close {
+                width: 32px;
+                height: 32px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                border-radius: var(--bz-radius-sm);
+                background: none;
+                border: none;
+                color: var(--bz-text-muted);
+                font-size: 20px;
+                cursor: pointer;
+                transition: background var(--bz-transition), color var(--bz-transition);
+            }
+            .bizyair-modal-close:hover {
+                background: var(--bz-bg-hover);
+                color: var(--bz-text);
+            }
+
+            /* ===== Tabs ===== */
+            .bizyair-tabs {
+                display: flex;
+                background: var(--bz-bg-card);
+                border-bottom: 1px solid var(--bz-border);
+                flex-shrink: 0;
+            }
+            .bizyair-tab {
+                flex: 1;
+                text-align: center;
+                padding: 12px 8px;
+                cursor: pointer;
+                color: var(--bz-text-muted);
+                font-size: 13px;
+                font-weight: 600;
+                border-bottom: 2px solid transparent;
+                transition: color var(--bz-transition), border-color var(--bz-transition), background var(--bz-transition);
+                user-select: none;
+            }
+            .bizyair-tab:hover {
+                color: var(--bz-text);
+                background: var(--bz-bg-hover);
+            }
+            .bizyair-tab.active {
+                color: var(--bz-accent);
+                border-bottom-color: var(--bz-accent);
+            }
+
+            /* ===== View Scroll Area ===== */
+            .bizyair-view-scroll {
+                flex: 1 1 0;
+                min-height: 0;
+                padding: 16px;
+                overflow-y: auto;
+                overscroll-behavior: contain;
+                box-sizing: border-box;
+                -webkit-overflow-scrolling: touch;
+            }
+            .bizyair-view-end-spacer {
+                height: 24px;
+                flex: 0 0 auto;
+            }
+
+            /* ===== Panel Card ===== */
+            .bizyair-panel-card {
+                background: var(--bz-bg-card);
+                border: 1px solid var(--bz-border);
+                border-radius: var(--bz-radius-md);
+                padding: 14px;
+                margin-bottom: 14px;
+            }
+            .bizyair-panel-card-title {
+                font-size: 13px;
+                font-weight: 700;
+                color: var(--bz-accent-light);
+                margin-bottom: 12px;
+            }
+            .bizyair-panel-card-subtitle {
+                font-size: 11px;
+                color: var(--bz-text-dim);
+                margin-top: 2px;
+            }
+
+            /* ===== Form Elements ===== */
+            .bizyair-compact-label {
+                display: block;
+                margin-bottom: 4px;
+                color: var(--bz-text-muted);
+                font-size: 12px;
+                font-weight: 500;
+            }
+            .bizyair-input {
+                width: 100%;
+                background: var(--bz-bg-input);
+                border: 1px solid var(--bz-border);
+                color: var(--bz-text);
+                padding: 9px 11px;
+                border-radius: var(--bz-radius-sm);
+                margin-bottom: 12px;
+                box-sizing: border-box;
+                font-size: 13px;
+                font-family: var(--bz-font);
+                transition: border-color var(--bz-transition);
+                outline: none;
+            }
+            .bizyair-input:focus {
+                border-color: var(--bz-border-focus);
+            }
+            .bizyair-input::placeholder {
+                color: var(--bz-text-dim);
+            }
+            textarea.bizyair-input {
+                resize: vertical;
+                line-height: 1.5;
+            }
+            select.bizyair-input {
+                cursor: pointer;
+                appearance: auto;
+            }
+
+            /* ===== Checkbox Row ===== */
+            .bizyair-check-row {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                cursor: pointer;
+                padding: 6px 0;
+            }
+            .bizyair-check-row input[type="checkbox"] {
+                accent-color: var(--bz-accent);
+                width: 16px;
+                height: 16px;
+                flex-shrink: 0;
+            }
+            .bizyair-check-row span {
+                color: var(--bz-text);
+                font-size: 13px;
+                line-height: 1.4;
+            }
+
+            /* ===== Buttons ===== */
+            .bizyair-btn {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                padding: 8px 16px;
+                border: none;
+                border-radius: var(--bz-radius-sm);
+                cursor: pointer;
+                font-weight: 600;
+                font-size: 13px;
+                font-family: var(--bz-font);
+                white-space: nowrap;
+                transition: opacity var(--bz-transition), transform var(--bz-transition), background var(--bz-transition);
+            }
+            .bizyair-btn:hover {
+                opacity: 0.88;
+            }
+            .bizyair-btn:active {
+                transform: scale(0.97);
+            }
+            .bizyair-btn-primary {
+                background: var(--bz-accent);
+                color: white;
+            }
+            .bizyair-btn-secondary {
+                background: var(--bz-bg-hover);
+                color: var(--bz-text-muted);
+            }
+            .bizyair-btn-danger {
+                background: var(--bz-danger);
+                color: white;
+            }
+            .bizyair-btn-success {
+                background: var(--bz-success);
+                color: white;
+            }
+            .bizyair-btn-full {
+                width: 100%;
+            }
+            .bizyair-btn-sm {
+                padding: 5px 10px;
+                font-size: 11px;
+            }
+
+            /* ===== Layout Helpers ===== */
             .bizyair-stack {
                 display: flex;
                 flex-direction: column;
@@ -1143,64 +1438,52 @@
                 grid-template-columns: repeat(2, minmax(0, 1fr));
                 gap: 10px;
             }
-            .bizyair-modal-shell {
-                width: min(1180px, calc(100vw - 32px));
-                max-width: 1180px;
-                height: min(92vh, 940px);
-                max-height: 92vh;
-                background: #181818;
-                border: 1px solid #333;
-                border-radius: 14px;
-                box-shadow: 0 24px 80px rgba(0,0,0,0.45);
-                overflow: hidden;
+            .bizyair-field {
                 display: flex;
                 flex-direction: column;
+                gap: 2px;
             }
-            .bizyair-panel-card {
-                margin-bottom: 15px;
-                padding: 12px;
-                background: #2a2a2a;
-                border-radius: 8px;
+            .bizyair-field .bizyair-input {
+                margin-bottom: 0;
             }
-            .bizyair-view-scroll {
-                padding: 16px;
-                overflow-y: auto;
-                max-height: calc(92vh - 112px);
-                padding-bottom: 96px;
-                box-sizing: border-box;
+            .bizyair-hint {
+                font-size: 11px;
+                color: var(--bz-text-dim);
+                line-height: 1.5;
+                margin-top: 4px;
             }
-            .bizyair-view-end-spacer {
-                height: max(88px, calc(env(safe-area-inset-bottom) + 72px));
-                flex: 0 0 auto;
+
+            /* ===== Section Title ===== */
+            .bizyair-section-title {
+                font-size: 13px;
+                font-weight: 700;
+                color: var(--bz-accent-light);
+                margin: 18px 0 10px;
             }
-            .bizyair-compact-label {
-                display: block;
-                margin-bottom: 5px;
-                color: #aaa;
-                font-size: 12px;
-            }
+
+            /* ===== Chat Inject Button ===== */
             .bizyair-inject-btn {
                 display: inline-flex;
                 align-items: center;
                 gap: 5px;
-                background: linear-gradient(90deg, #8b5cf6, #a855f7);
+                background: linear-gradient(135deg, #7c3aed, #a855f7);
                 color: white;
                 border: none;
                 padding: 4px 12px;
-                border-radius: 12px;
+                border-radius: var(--bz-radius-pill);
                 font-size: 12px;
                 font-weight: bold;
                 cursor: pointer;
                 margin-left: 8px;
                 vertical-align: middle;
-                transition: transform 0.2s, opacity 0.2s;
+                transition: transform var(--bz-transition), opacity var(--bz-transition);
             }
             .bizyair-inject-btn:hover {
                 transform: scale(1.05);
                 opacity: 0.9;
             }
             .bizyair-inject-btn.loading {
-                background: #ef4444;
+                background: var(--bz-danger);
                 cursor: pointer;
                 animation: bizyair-pulse 1.5s infinite;
             }
@@ -1208,234 +1491,232 @@
                 0%, 100% { opacity: 1; }
                 50% { opacity: 0.7; }
             }
+
+            /* ===== Result Image ===== */
             .bizyair-result-img {
                 max-width: 300px;
                 max-height: 300px;
-                border-radius: 8px;
-                border: 2px solid #a855f7;
-                box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+                border-radius: var(--bz-radius-md);
+                border: 2px solid var(--bz-accent);
+                box-shadow: 0 4px 20px rgba(0,0,0,0.4);
                 display: block;
                 margin-top: 8px;
                 cursor: pointer;
-                animation: bizyair-fade-in 0.5s ease;
+                animation: bizyair-fade-in 0.4s ease;
             }
             .bizyair-result-img:hover {
                 filter: brightness(1.1);
-                border-color: #fff;
+                border-color: var(--bz-accent-light);
             }
             @keyframes bizyair-fade-in {
-                from { opacity: 0; transform: translateY(10px); }
+                from { opacity: 0; transform: translateY(8px); }
                 to { opacity: 1; transform: translateY(0); }
             }
-            #bizyair-toast {
-                position: fixed;
-                top: 20px;
-                left: 50%;
-                transform: translateX(-50%);
-                background: #10b981;
-                color: white;
-                padding: 10px 20px;
-                border-radius: 20px;
-                font-size: 14px;
-                font-weight: bold;
-                z-index: 1000000;
-                box-shadow: 0 4px 10px rgba(0,0,0,0.3);
-                opacity: 0;
-                transition: opacity 0.3s;
-                pointer-events: none;
+
+            /* ===== Gallery Grid ===== */
+            #bizyair-gallery-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+                gap: 10px;
             }
-            #bizyair-toast.show { opacity: 1; top: 30px; }
-            
-            #bizyair-settings-modal {
-                display: none;
+            .bizyair-gallery-item {
+                position: relative;
+                aspect-ratio: 1;
+                background: #000;
+                border-radius: var(--bz-radius-sm);
+                overflow: hidden;
+                cursor: pointer;
+                border: 2px solid transparent;
+                transition: border-color var(--bz-transition);
+            }
+            .bizyair-gallery-item:hover {
+                border-color: var(--bz-accent);
+            }
+            .bizyair-gallery-item.selected {
+                border-color: var(--bz-accent);
+            }
+            .bizyair-gallery-item img {
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
+            }
+
+            /* ===== Preset Item ===== */
+            .bizyair-preset-item {
+                display: flex;
+                gap: 8px;
+                align-items: flex-start;
+                padding: 10px;
+                border-radius: var(--bz-radius-sm);
+                border: 1px solid var(--bz-border);
+                background: var(--bz-bg-input);
+                margin-top: 8px;
+                transition: border-color var(--bz-transition);
+                cursor: pointer;
+            }
+            .bizyair-preset-item:hover {
+                border-color: var(--bz-accent);
+            }
+            .bizyair-preset-item.active {
+                border-color: var(--bz-accent);
+                background: var(--bz-accent-glow);
+            }
+            .bizyair-preset-item.editing {
+                box-shadow: 0 0 0 1px var(--bz-info) inset;
+            }
+
+            /* ===== Tag Output Scene Card ===== */
+            .bizyair-scene-card {
+                background: var(--bz-bg-input);
+                border: 1px solid var(--bz-border);
+                border-radius: var(--bz-radius-sm);
+                padding: 12px;
+                margin-bottom: 10px;
+            }
+
+            /* ===== Overlay (for dynamic popup dialogs) ===== */
+            .bizyair-overlay {
                 position: fixed;
-                z-index: 99999;
-                left: 0;
                 top: 0;
-                width: 100vw;
-                height: 100vh;
-                background: rgba(0,0,0,0.7);
+                left: 0;
+                width: 100%;
+                height: 100%;
+                max-width: 100%;
+                max-height: 100%;
+                margin: 0;
+                padding: 16px;
+                border: none;
+                background: transparent;
+                display: flex;
                 align-items: center;
                 justify-content: center;
+                box-sizing: border-box;
+                overflow: hidden;
             }
-            #bizyair-settings-modal.show { display: flex; }
-            .bizyair-modal-content {
-                background: #1e1e1e;
-                border: 1px solid #333;
-                border-radius: 10px;
-                width: 90%;
-                max-width: 500px;
-                max-height: 90vh;
-                overflow-y: auto;
-                padding: 20px;
-                color: #ddd;
-                font-family: "Microsoft YaHei", sans-serif;
+            .bizyair-overlay::backdrop {
+                background: var(--bz-bg-overlay);
             }
-            
-            /* 移动端适配 */
-            @media screen and (max-width: 768px) {
-                #bizyair-settings-modal { padding: 0 !important; }
-                #bizyair-settings-modal .bizyair-modal-content {
-                    width: 100vw !important;
-                    max-width: 100vw !important;
-                    height: 100vh !important;
-                    max-height: 100vh !important;
-                    border-radius: 0 !important;
-                    padding: 10px !important;
-                }
-                #bizyair-settings-modal .bizyair-modal-header {
-                    padding: 10px 0 !important;
-                    font-size: 16px !important;
-                }
-                #bizyair-settings-modal .bizyair-tabs {
-                    display: flex !important;
-                    margin-bottom: 10px !important;
-                }
-                #bizyair-settings-modal .bizyair-tab {
-                    flex: 1 !important;
-                    padding: 12px 10px !important;
-                    font-size: 14px !important;
-                }
-                #bizyair-settings-modal .bizyair-input, 
-                #bizyair-settings-modal select {
-                    font-size: 16px !important;
-                    padding: 12px 8px !important;
-                }
-                #bizyair-settings-modal .bizyair-view {
-                    padding: 5px !important;
-                    padding-bottom: 50px !important;
-                }
-                #bizyair-settings-modal #bizyair-gallery-grid {
-                    grid-template-columns: repeat(2, 1fr) !important;
-                    gap: 8px !important;
-                    padding-bottom: 50px !important;
-                }
+            .bizyair-overlay.bizyair-overlay-top::backdrop {
+                background: rgba(0,0,0,0.72);
             }
-            .bizyair-modal-header {
-                font-size: 18px;
-                font-weight: bold;
-                margin-bottom: 20px;
+
+            /* ===== Row that stays horizontal on mobile ===== */
+            .bizyair-row-inline {
                 display: flex;
-                justify-content: space-between;
+                gap: 8px;
                 align-items: center;
+                flex-wrap: nowrap;
             }
-            .bizyair-input {
+
+            /* ===== Image Viewer Overlay ===== */
+            #bizyair-gallery {
+                position: fixed;
+                top: 0;
+                left: 0;
                 width: 100%;
-                background: #2a2a2a;
-                border: 1px solid #444;
-                color: #ccc;
-                padding: 10px;
-                border-radius: 4px;
-                margin-bottom: 15px;
+                height: 100%;
+                max-width: 100%;
+                max-height: 100%;
+                margin: 0;
+                padding: 0;
+                border: none;
+                background: rgba(0,0,0,0.95);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                cursor: pointer;
                 box-sizing: border-box;
             }
-            .bizyair-btn {
-                padding: 10px 20px;
-                border: none;
-                border-radius: 4px;
-                cursor: pointer;
-                font-weight: bold;
-                margin-right: 10px;
-                white-space: nowrap;
+            #bizyair-gallery::backdrop {
+                background: transparent;
             }
-            .bizyair-btn-primary { background: #8b5cf6; color: white; }
-            .bizyair-btn-secondary { background: #444; color: #aaa; }
-            @media screen and (min-width: 1280px) {
-                .bizyair-modal-shell {
-                    width: min(1280px, calc(100vw - 48px));
+
+            /* ===== Global box-sizing ===== */
+            [class^="bizyair-"],
+            [class*=" bizyair-"],
+            [id^="bizyair-"] {
+                box-sizing: border-box;
+            }
+
+            /* ===== Responsive: Mobile ===== */
+            @media screen and (max-width: 640px) {
+                /* Settings modal: dialog fills screen */
+                #bizyair-settings-modal {
+                    padding: 0;
+                }
+                #bizyair-settings-modal .bizyair-modal-shell {
+                    width: 100% !important;
+                    height: 100% !important;
+                    max-width: none !important;
+                    max-height: none !important;
+                    border-radius: 0 !important;
+                    border: none !important;
+                    box-shadow: none !important;
+                    margin: 0 !important;
                 }
                 .bizyair-view-scroll {
-                    padding: 18px 20px;
+                    padding: 12px !important;
+                    padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 32px) !important;
                 }
-            }
-            @media screen and (max-width: 900px) {
+                .bizyair-tab {
+                    padding: 14px 6px;
+                    font-size: 13px;
+                }
                 .bizyair-two-col {
                     grid-template-columns: 1fr;
                 }
-                .bizyair-view-scroll {
-                    max-height: calc(100vh - 108px);
-                    padding-bottom: 104px;
-                }
-            }
-            @media screen and (max-width: 768px) {
-                .bizyair-modal-shell {
-                    width: 100vw;
-                    height: 100vh;
-                    max-height: 100vh;
-                    border-radius: 0;
-                    border: none;
-                }
-                .bizyair-view-scroll {
-                    padding: 10px;
-                    padding-bottom: calc(env(safe-area-inset-bottom) + 120px);
-                    max-height: calc(100vh - 102px);
-                }
-                .bizyair-view-end-spacer {
-                    height: calc(env(safe-area-inset-bottom) + 132px);
-                }
-                .bizyair-row,
-                .bizyair-actions {
+                .bizyair-row {
                     flex-direction: column;
                     align-items: stretch;
                 }
-                .bizyair-btn {
-                    width: 100%;
-                    margin-right: 0;
+                .bizyair-actions {
+                    flex-direction: row;
+                    flex-wrap: wrap;
+                }
+                .bizyair-actions .bizyair-btn {
+                    flex: 1 1 auto;
+                    min-width: 0;
+                }
+                .bizyair-row-inline {
+                    flex-direction: row !important;
+                    flex-wrap: nowrap !important;
                 }
                 .bizyair-input,
                 select.bizyair-input {
                     font-size: 16px;
-                    padding: 12px 10px;
+                    padding: 12px 11px;
                 }
                 .bizyair-result-img {
                     max-width: min(100%, 280px);
                     max-height: 260px;
                 }
-                #bizyair-magic-action-modal {
-                    position: fixed !important;
-                    inset: 0 !important;
-                    width: 100dvw !important;
-                    height: 100dvh !important;
-                    z-index: 2147483646 !important;
-                    align-items: center !important;
-                    justify-content: center !important;
-                    padding: max(12px, env(safe-area-inset-top)) 12px max(12px, env(safe-area-inset-bottom)) 12px !important;
-                    box-sizing: border-box;
-                    overflow-y: auto;
-                    isolation: isolate;
+                #bizyair-gallery-grid {
+                    grid-template-columns: repeat(2, 1fr);
+                    gap: 8px;
                 }
-                #bizyair-magic-action-modal .bizyair-modal-shell {
-                    width: min(100%, 420px) !important;
+                /* Dynamic popup overlays on mobile: bottom sheet */
+                .bizyair-overlay {
+                    padding: 0;
+                    align-items: flex-end;
+                }
+                .bizyair-overlay .bizyair-modal-shell {
+                    width: 100% !important;
+                    max-width: none !important;
                     height: auto !important;
-                    max-height: calc(100vh - max(24px, env(safe-area-inset-top)) - max(24px, env(safe-area-inset-bottom))) !important;
-                    margin: 0 auto !important;
-                    border: 1px solid #333 !important;
-                    border-radius: 12px !important;
+                    max-height: 85% !important;
+                    border-radius: var(--bz-radius-lg) var(--bz-radius-lg) 0 0 !important;
+                    border: none !important;
+                    box-shadow: none !important;
+                    margin: 0 !important;
+                    overflow-y: auto !important;
+                    padding-bottom: env(safe-area-inset-bottom, 0px);
                 }
-                #bizyair-character-build-modal {
-                    position: fixed !important;
-                    inset: 0 !important;
-                    width: 100dvw !important;
-                    height: 100dvh !important;
-                    z-index: 2147483647 !important;
-                    align-items: center !important;
-                    justify-content: center !important;
-                    padding: max(12px, env(safe-area-inset-top)) 12px max(12px, env(safe-area-inset-bottom)) 12px !important;
-                    box-sizing: border-box;
-                    overflow-y: auto;
-                    isolation: isolate;
+                /* Preset item buttons */
+                .bizyair-preset-item {
+                    flex-direction: column;
                 }
-                #bizyair-character-build-modal .bizyair-modal-shell {
-                    width: min(100%, 760px) !important;
-                    max-width: 760px !important;
-                    height: auto !important;
-                    max-height: calc(100vh - max(24px, env(safe-area-inset-top)) - max(24px, env(safe-area-inset-bottom))) !important;
-                    margin: 0 auto !important;
-                    border: 1px solid #333 !important;
-                    border-radius: 12px !important;
-                }
-                #bizyair-character-build-modal .bizyair-view-scroll {
-                    max-height: calc(100vh - max(120px, env(safe-area-inset-top)) - max(24px, env(safe-area-inset-bottom))) !important;
+                .bizyair-preset-item > div:last-child {
+                    align-self: flex-start;
                 }
             }
         `;
@@ -1742,31 +2023,30 @@
         if (!container) return;
         const list = promptPresets[type] || [];
         if (list.length === 0) {
-            container.innerHTML = `<div style="font-size:12px;color:#666;padding:8px 0;">暂无预设</div>`;
+            container.innerHTML = `<div class="bizyair-hint" style="padding:8px 0;">暂无预设</div>`;
             return;
         }
 
         container.innerHTML = list.map(item => {
             const isSelected = presetEditorSelection[type] === item.id;
-            const activeStyle = item.active ? "border:1px solid #8b5cf6;background:#2a2135;" : "border:1px solid #3a3a3a;background:#202020;";
-            const selectedStyle = isSelected ? "box-shadow:0 0 0 1px #38bdf8 inset;" : "";
+            const classes = ["bizyair-preset-item"];
+            if (item.active) classes.push("active");
+            if (isSelected) classes.push("editing");
             const preview = escapeHtml((item.content || "").substring(0, 90).replace(/\n/g, " "));
             const historyCount = Array.isArray(item.history) ? item.history.length : 0;
-            const activeBtn = type === "char"
-                ? `<button class="bizyair-btn" style="padding:4px 8px;font-size:11px;background:${item.active ? '#16a34a' : '#4b5563'};color:white;" onclick="event.stopPropagation();window.toggleBizyairPromptPreset('${type}', ${item.id})">${item.active ? '启用中' : '启用'}</button>`
-                : `<button class="bizyair-btn" style="padding:4px 8px;font-size:11px;background:${item.active ? '#16a34a' : '#4b5563'};color:white;" onclick="event.stopPropagation();window.toggleBizyairPromptPreset('${type}', ${item.id})">${item.active ? '默认' : '设为默认'}</button>`;
+            const activeLabel = type === "char" ? (item.active ? '启用中' : '启用') : (item.active ? '默认' : '设为默认');
+            const activeBg = item.active ? 'var(--bz-success)' : 'var(--bz-bg-hover)';
             return `
-                <div style="display:flex;gap:8px;align-items:flex-start;padding:8px;border-radius:6px;${activeStyle}${selectedStyle};margin-top:8px;" onclick="window.loadBizyairPresetToEditor('${type}', ${item.id})">
+                <div class="${classes.join(' ')}" onclick="window.loadBizyairPresetToEditor('${type}', ${item.id})">
                     <div style="flex:1;min-width:0;">
-                        <div style="font-weight:bold;color:#ddd;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(item.name)}</div>
-                        <div style="font-size:11px;color:#888;word-break:break-word;">${preview || "空内容"}</div>
-                        <div style="font-size:11px;color:#666;margin-top:4px;">${isSelected ? "正在编辑" : "点击载入编辑"}${historyCount > 0 ? ` | 历史 ${historyCount}` : ""}</div>
+                        <div style="font-weight:600;color:var(--bz-text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:13px;">${escapeHtml(item.name)}</div>
+                        <div style="font-size:11px;color:var(--bz-text-muted);word-break:break-word;margin-top:2px;">${preview || "空内容"}</div>
+                        <div style="font-size:11px;color:var(--bz-text-dim);margin-top:3px;">${isSelected ? "编辑中" : "点击编辑"}${historyCount > 0 ? ` | 历史 ${historyCount}` : ""}</div>
                     </div>
-                    <div style="display:flex;gap:6px;flex:0 0 auto;">
-                        ${activeBtn}
-                        <button class="bizyair-btn" style="padding:4px 8px;font-size:11px;background:#2563eb;color:white;" onclick="event.stopPropagation();window.loadBizyairPresetToEditor('${type}', ${item.id})">编辑</button>
-                        <button class="bizyair-btn" style="padding:4px 8px;font-size:11px;background:#7c3aed;color:white;" onclick="event.stopPropagation();window.cloneBizyairPromptPreset('${type}', ${item.id})">复制</button>
-                        <button class="bizyair-btn" style="padding:4px 8px;font-size:11px;background:#ef4444;color:white;" onclick="event.stopPropagation();window.deleteBizyairPromptPreset('${type}', ${item.id})">删除</button>
+                    <div style="display:flex;gap:4px;flex:0 0 auto;flex-wrap:wrap;">
+                        <button class="bizyair-btn bizyair-btn-sm" style="background:${activeBg};color:white;" onclick="event.stopPropagation();window.toggleBizyairPromptPreset('${type}', ${item.id})">${activeLabel}</button>
+                        <button class="bizyair-btn bizyair-btn-sm" style="background:#7c3aed;color:white;" onclick="event.stopPropagation();window.cloneBizyairPromptPreset('${type}', ${item.id})">复制</button>
+                        <button class="bizyair-btn bizyair-btn-sm bizyair-btn-danger" onclick="event.stopPropagation();window.deleteBizyairPromptPreset('${type}', ${item.id})">删除</button>
                     </div>
                 </div>
             `;
@@ -2036,7 +2316,7 @@
         updateTagContextInput();
         const modal = document.getElementById("bizyair-settings-modal");
         if (modal) {
-            modal.classList.add("show");
+            if (!modal.open) modal.showModal();
             window.switchBizyairTab("tagger");
         }
     }
@@ -2223,13 +2503,44 @@
         return persistMessageTextUpdate(messageId, nextText);
     }
 
+    function applyContextFilters(text) {
+        if (!text) return "";
+        // Built-in: remove <image>image##...##<image> tags
+        text = text.replace(/<image>image##[^#]*##<image>/g, "");
+        // User-defined regex rules (one per line)
+        if (contextRegexRules) {
+            const lines = contextRegexRules.split("\n").map(l => l.trim()).filter(Boolean);
+            for (const line of lines) {
+                try {
+                    const regex = new RegExp(line, "g");
+                    text = text.replace(regex, "");
+                } catch (e) {
+                    console.warn("[BizyAir] 无效的过滤正则:", line, e);
+                }
+            }
+        }
+        return text.replace(/\n{3,}/g, "\n\n").trim();
+    }
+
     function getLatestMessagesContext(count) {
+        const context = getSillyTavernContextSafe();
+        if (context && Array.isArray(context.chat) && context.chat.length > 0) {
+            const recent = context.chat.slice(-count);
+            return recent.map(msg => {
+                let text = String(msg.mes || "").trim();
+                text = applyContextFilters(text);
+                return text;
+            }).filter(Boolean).join("\n\n---\n\n");
+        }
+        // Fallback: DOM scraping if context API unavailable
         const messages = Array.from(document.querySelectorAll(".mes_text"));
         if (messages.length === 0) return "";
         return messages.slice(-count).map(el => {
             const clone = el.cloneNode(true);
             clone.querySelectorAll(".bizyair-inject-wrapper, .bizyair-result-img, button").forEach(node => node.remove());
-            return clone.innerText.trim();
+            let text = clone.innerText.trim();
+            text = applyContextFilters(text);
+            return text;
         }).filter(Boolean).join("\n\n---\n\n");
     }
 
@@ -2245,24 +2556,42 @@
         return capturedContext;
     }
 
-    function shouldAutoTagAfterMessage(messageId) {
-        if (!autoTagAfterMessageEnabled) return false;
-        if (!Number.isInteger(messageId) || messageId < 0) return false;
-        if (autoTagProcessedMessageIds.has(messageId)) return false;
-        if (!llmSettings.key) return false;
+    function normalizeMessageId(value) {
+        const numeric = Number.parseInt(value, 10);
+        return Number.isFinite(numeric) ? numeric : -1;
+    }
+
+    function getAutoTagSkipReason(messageId) {
+        const normalizedId = normalizeMessageId(messageId);
+        if (!autoTagAfterMessageEnabled) return "autoTagAfterMessage disabled";
+        if (!Number.isInteger(normalizedId) || normalizedId < 0) return "invalid messageId";
+        if (autoTagProcessedMessageIds.has(normalizedId)) return "message already processed";
+        if (!llmSettings.key) return "llm key missing";
 
         const context = getSillyTavernContextSafe();
-        const message = context?.chat?.[messageId];
-        if (!message || !String(message.mes || "").trim()) return false;
-        return true;
+        const message = context?.chat?.[normalizedId];
+        if (!message) return "message not found";
+        if (!String(message.mes || "").trim()) return "message empty";
+        return "";
+    }
+
+    function shouldAutoTagAfterMessage(messageId) {
+        return !getAutoTagSkipReason(messageId);
     }
 
     async function triggerAutoTagForMessage(messageId) {
-        if (!shouldAutoTagAfterMessage(messageId)) return;
+        const normalizedId = normalizeMessageId(messageId);
+        const skipReason = getAutoTagSkipReason(normalizedId);
+        if (skipReason) {
+            if (autoTagAfterMessageEnabled) {
+                console.debug("[BizyAir] auto-tag skipped:", skipReason, { messageId, normalizedId });
+            }
+            return;
+        }
 
-        autoTagProcessedMessageIds.add(messageId);
+        autoTagProcessedMessageIds.add(normalizedId);
         if (autoTagInFlight) {
-            autoTagPendingMessageId = messageId;
+            autoTagPendingMessageId = normalizedId;
             return;
         }
 
@@ -2270,9 +2599,11 @@
         try {
             const text = captureRecentChatContext();
             if (!text) return;
+            showToast("正在分析剧情并生成 Tag...");
             await generatePromptTags();
         } catch (e) {
             console.error("自动触发独立 API 生图失败:", e);
+            showToast("自动生图失败: " + (e.message || e));
         } finally {
             autoTagInFlight = false;
             if (autoTagPendingMessageId !== null) {
@@ -2287,11 +2618,15 @@
 
     function bindAutoTagAfterMessageListener() {
         if (autoTagListenerBound) return;
-        const eventSource = window.eventSource;
-        const eventTypes = window.event_types;
+        const context = getSillyTavernContextSafe();
+        const eventSource = context?.eventSource;
+        const eventTypes = context?.eventTypes;
         if (!eventSource || !eventTypes?.CHARACTER_MESSAGE_RENDERED) return;
 
         eventSource.on(eventTypes.CHARACTER_MESSAGE_RENDERED, (messageId) => {
+            if (autoTagAfterMessageEnabled) {
+                console.debug("[BizyAir] CHARACTER_MESSAGE_RENDERED received:", messageId);
+            }
             triggerAutoTagForMessage(messageId);
         });
         if (eventTypes.CHAT_CHANGED) {
@@ -2534,8 +2869,7 @@
 
     async function parseAndRenderTagOutput(text) {
         const container = document.getElementById("bizyair-tag-output");
-        if (!container) return;
-        container.innerHTML = "";
+        if (container) container.innerHTML = "";
 
         const locatorRegex = /(<(?:角色|定位)>)([\s\S]*?)(<\/(?:角色|定位)>)/g;
         const dataRegex = /<资料>([\s\S]*?)<\/资料>/g;
@@ -2556,18 +2890,20 @@
                 sceneIndex += 1;
                 foundAny = true;
                 const inserted = await insertImageTagIntoChat(content, currentRole);
-                container.insertAdjacentHTML("beforeend", `
-                    <div data-bizyair-scene="${sceneIndex}" data-bizyair-locator="${escapeHtml(content)}" style="background:#202020;border:1px solid #333;border-radius:6px;padding:10px;margin-bottom:10px;">
-                        <div style="font-weight:bold;color:#a855f7;margin-bottom:6px;">场景 ${sceneIndex}</div>
-                        <div style="font-size:12px;color:#aaa;margin-bottom:6px;">定位: ${escapeHtml(content)}</div>
-                        <div style="font-size:12px;color:${inserted ? '#16a34a' : '#f59e0b'};margin-bottom:6px;">${inserted ? '已插入 image 标签到正文' : '未命中定位文本，未插入正文'}</div>
-                        <textarea class="bizyair-input" rows="3" data-role-prompt="${sceneIndex}" style="margin-bottom:8px;">${escapeHtml(currentRole)}</textarea>
-                        <div class="bizyair-actions">
-                            <button class="bizyair-btn bizyair-btn-primary" onclick="window.bizyairApplyRolePrompt(${sceneIndex})">写入正面提示词</button>
-                            <button class="bizyair-btn bizyair-btn-secondary" onclick="window.bizyairGenerateScene(${sceneIndex})">重新插入 image 标签</button>
+                if (container) {
+                    container.insertAdjacentHTML("beforeend", `
+                        <div class="bizyair-scene-card" data-bizyair-scene="${sceneIndex}" data-bizyair-locator="${escapeHtml(content)}">
+                            <div style="font-weight:600;color:var(--bz-accent-light);margin-bottom:6px;">场景 ${sceneIndex}</div>
+                            <div class="bizyair-hint" style="margin-bottom:6px;">定位: ${escapeHtml(content)}</div>
+                            <div style="font-size:12px;color:${inserted ? 'var(--bz-success)' : 'var(--bz-warning)'};margin-bottom:8px;">${inserted ? '已插入 image 标签' : '未命中定位文本'}</div>
+                            <textarea class="bizyair-input" rows="3" data-role-prompt="${sceneIndex}" style="margin-bottom:8px;">${escapeHtml(currentRole)}</textarea>
+                            <div class="bizyair-actions">
+                                <button class="bizyair-btn bizyair-btn-primary bizyair-btn-sm" onclick="window.bizyairApplyRolePrompt(${sceneIndex})">写入提示词</button>
+                                <button class="bizyair-btn bizyair-btn-secondary bizyair-btn-sm" onclick="window.bizyairGenerateScene(${sceneIndex})">重新插入标签</button>
+                            </div>
                         </div>
-                    </div>
-                `);
+                    `);
+                }
                 currentRole = null;
             }
         }
@@ -2575,16 +2911,26 @@
         const dataMatches = [...text.matchAll(dataRegex)];
         dataMatches.forEach((dataMatch, idx) => {
             foundAny = true;
-            container.insertAdjacentHTML("beforeend", `
-                <div style="background:#202020;border:1px solid #333;border-radius:6px;padding:10px;margin-bottom:10px;">
-                    <div style="font-weight:bold;color:#f59e0b;margin-bottom:6px;">角色资料 ${idx + 1}</div>
-                    <textarea class="bizyair-input" rows="4" style="margin-bottom:0;">${escapeHtml((dataMatch[1] || "").trim())}</textarea>
-                </div>
-            `);
+            if (container) {
+                container.insertAdjacentHTML("beforeend", `
+                    <div class="bizyair-scene-card">
+                        <div style="font-weight:600;color:var(--bz-warning);margin-bottom:6px;">角色资料 ${idx + 1}</div>
+                        <textarea class="bizyair-input" rows="4" style="margin-bottom:0;">${escapeHtml((dataMatch[1] || "").trim())}</textarea>
+                    </div>
+                `);
+            }
         });
 
-        if (!foundAny) {
+        if (!foundAny && container) {
             container.innerHTML = `<textarea class="bizyair-input" rows="8">${escapeHtml(text)}</textarea>`;
+        }
+
+        if (!container) {
+            if (sceneIndex > 0) {
+                showToast("自动生图: 已插入 " + sceneIndex + " 个场景");
+            } else if (!foundAny) {
+                showToast("自动生图: 未解析到场景标签");
+            }
         }
     }
 
@@ -2716,21 +3062,21 @@
 
     function openCharacterBuildReviewModal() {
         closeCharacterBuildReviewModal();
-        const modal = document.createElement("div");
+        const modal = document.createElement("dialog");
         modal.id = "bizyair-character-build-modal";
-        modal.style.cssText = "position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,0.72);display:flex;align-items:center;justify-content:center;padding:16px;";
+        modal.className = "bizyair-overlay bizyair-overlay-top";
         modal.innerHTML = `
-            <div class="bizyair-modal-shell" style="width:min(760px, calc(100vw - 24px));max-width:760px;height:min(88vh,960px);background:#1c1c1c;">
-                <div class="bizyair-row" style="justify-content:space-between;padding:18px 18px 0 18px;">
-                    <div data-bizyair-build-title style="font-size:18px;font-weight:bold;">角色资料预览</div>
-                    <button type="button" class="bizyair-btn" style="margin-right:0;background:#333;color:#bbb;padding:6px 10px;" onclick="window.closeBizyairCharacterBuildModal()">关闭</button>
+            <div class="bizyair-modal-shell" style="width:min(760px, calc(100vw - 24px));max-width:760px;height:auto;max-height:min(88vh,960px);">
+                <div class="bizyair-modal-header">
+                    <span class="bizyair-title" data-bizyair-build-title>角色资料预览</span>
+                    <button class="bizyair-modal-close" onclick="window.closeBizyairCharacterBuildModal()">&times;</button>
                 </div>
                 <div class="bizyair-view-scroll" style="padding-top:12px;">
-                    <div data-bizyair-build-status style="font-size:12px;color:#aaa;margin-bottom:10px;">确认后保存，或打回重写。</div>
+                    <div data-bizyair-build-status class="bizyair-hint" style="margin-bottom:10px;">确认后保存，或打回重写。</div>
                     <textarea data-bizyair-build-text class="bizyair-input" rows="16" style="min-height:280px;margin-bottom:12px;"></textarea>
                     <div class="bizyair-actions" style="justify-content:flex-end;">
-                    <button type="button" class="bizyair-btn bizyair-btn-secondary" data-bizyair-build-retry onclick="window.retryBizyairCharacterBuild()">打回重写</button>
-                    <button type="button" class="bizyair-btn bizyair-btn-primary" data-bizyair-build-save onclick="window.saveBizyairCharacterBuild()">保存</button>
+                        <button type="button" class="bizyair-btn bizyair-btn-secondary" data-bizyair-build-retry onclick="window.retryBizyairCharacterBuild()">打回重写</button>
+                        <button type="button" class="bizyair-btn bizyair-btn-primary" data-bizyair-build-save onclick="window.saveBizyairCharacterBuild()">保存</button>
                     </div>
                 </div>
             </div>
@@ -2739,6 +3085,7 @@
             if (event.target === modal) closeCharacterBuildReviewModal();
         });
         document.body.appendChild(modal);
+        modal.showModal();
         renderCharacterBuildReviewState();
     }
 
@@ -2772,331 +3119,338 @@
 
     function openMagicActionModal() {
         closeMagicActionModal();
-        const modal = document.createElement("div");
+        const modal = document.createElement("dialog");
         modal.id = "bizyair-magic-action-modal";
-        modal.style.cssText = "position:fixed;inset:0;z-index:2147483646;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;padding:16px;";
+        modal.className = "bizyair-overlay";
         modal.innerHTML = `
-            <div class="bizyair-modal-shell" style="width:min(420px, calc(100vw - 24px));max-width:420px;height:auto;background:#1c1c1c;padding:18px;">
-                <div class="bizyair-row" style="justify-content:space-between;margin-bottom:14px;">
+            <div class="bizyair-modal-shell" style="width:min(420px, calc(100vw - 24px));max-width:420px;height:auto;padding:18px;">
+                <div class="bizyair-row-inline" style="justify-content:space-between;margin-bottom:14px;">
                     <div>
-                        <div style="font-size:18px;font-weight:bold;">独立 Tag 工具</div>
-                        <div style="font-size:12px;color:#888;margin-top:4px;">双击酒馆魔法棒后选择执行路径</div>
+                        <div style="font-size:16px;font-weight:700;color:var(--bz-text);">独立 Tag 工具</div>
+                        <div class="bizyair-hint" style="margin-top:4px;">双击酒馆魔法棒后选择执行路径</div>
                     </div>
-                    <button type="button" class="bizyair-btn" style="margin-right:0;background:#333;color:#bbb;padding:6px 10px;" onclick="window.closeBizyairMagicActionModal()">关闭</button>
+                    <button class="bizyair-modal-close" onclick="window.closeBizyairMagicActionModal()">&times;</button>
                 </div>
-                <button type="button" class="bizyair-btn bizyair-btn-primary" style="width:100%;margin:0 0 10px 0;" onclick="window.startBizyairChatTagFlow()">开始生图</button>
-                <button type="button" class="bizyair-btn bizyair-btn-secondary" style="width:100%;margin:0;" onclick="window.startBizyairCharacterBuildFlow()">角色构建</button>
+                <button type="button" class="bizyair-btn bizyair-btn-primary bizyair-btn-full" style="margin:0 0 10px 0;" onclick="window.startBizyairChatTagFlow()">开始生图</button>
+                <button type="button" class="bizyair-btn bizyair-btn-secondary bizyair-btn-full" style="margin:0;" onclick="window.startBizyairCharacterBuildFlow()">角色构建</button>
             </div>
         `;
         modal.addEventListener("click", (event) => {
             if (event.target === modal) closeMagicActionModal();
         });
         document.body.appendChild(modal);
+        modal.showModal();
     }
 
     function createSettingsModal() {
         const existingModal = document.getElementById("bizyair-settings-modal");
         if (existingModal) existingModal.remove();
 
-        const styleId = "bizyair-settings-modal-style";
-        if (!document.getElementById(styleId)) {
-            const style = document.createElement("style");
-            style.id = styleId;
-            style.textContent = `
-            @media screen and (max-width: 768px) {
-                #bizyair-settings-modal .bizyair-modal-content { width: 100vw !important; height: 100vh !important; max-width: 100vw !important; max-height: 100vh !important; border-radius: 0 !important; }
-                #bizyair-settings-modal .bizyair-tabs { flex-wrap: wrap; }
-                #bizyair-settings-modal .bizyair-tab { flex: none; width: auto; padding: 10px 15px; }
-                #bizyair-settings-modal .bizyair-view { padding: 10px; }
-                #bizyair-settings-modal .bizyair-input, #bizyair-settings-modal select { font-size: 16px; padding: 12px; }
-            }
-            `;
-            document.head.appendChild(style);
-        }
-
         const templateOptions = buildTemplateOptionsHtml(bizyairTemplate);
         
-        const div = document.createElement("div");
+        const div = document.createElement("dialog");
         div.id = "bizyair-settings-modal";
         div.innerHTML = `
-            <div class="bizyair-modal-content bizyair-modal-shell">
+            <div class="bizyair-modal-shell">
                 <div class="bizyair-modal-header">
-                    <span>BizyAir 设置</span>
-                    <span style="cursor:pointer;font-size:24px;line-height:1;" onclick="document.getElementById('bizyair-settings-modal').classList.remove('show')">&times;</span>
+                    <span class="bizyair-title">BizyAir 设置</span>
+                    <button class="bizyair-modal-close" onclick="document.getElementById('bizyair-settings-modal').close()">&times;</button>
                 </div>
-                
-                <div class="bizyair-tabs" style="display:flex;background:#252525;border-bottom:1px solid #333;">
-                    <div class="bizyair-tab active" data-tab="settings" onclick="window.switchBizyairTab('settings')" style="flex:1;text-align:center;padding:12px;cursor:pointer;color:#a855f7;border-bottom:2px solid #a855f7;">⚙️ 设置</div>
-                    <div class="bizyair-tab" data-tab="tagger" onclick="window.switchBizyairTab('tagger')" style="flex:1;text-align:center;padding:12px;cursor:pointer;color:#888;">🪄 Tag</div>
-                    <div class="bizyair-tab" data-tab="gallery" onclick="window.switchBizyairTab('gallery')" style="flex:1;text-align:center;padding:12px;cursor:pointer;color:#888;">🖼️ 画廊</div>
+
+                <div class="bizyair-tabs">
+                    <div class="bizyair-tab active" data-tab="settings" onclick="window.switchBizyairTab('settings')">设置</div>
+                    <div class="bizyair-tab" data-tab="tagger" onclick="window.switchBizyairTab('tagger')">Tag</div>
+                    <div class="bizyair-tab" data-tab="gallery" onclick="window.switchBizyairTab('gallery')">画廊</div>
                 </div>
-                
+
+                <!-- ===== 设置 Tab ===== -->
                 <div id="bizyair-view-settings" class="bizyair-view bizyair-view-scroll">
                     <div class="bizyair-panel-card">
-                        <label class="bizyair-compact-label">API Key</label>
-                        <textarea id="bizyair-api-key" class="bizyair-input" rows="3" placeholder="输入你的 API Key，多个 Key 请用英文逗号分隔">${escapeHtml(bizyairApiKey)}</textarea>
-
-                        <label class="bizyair-compact-label">生图模板</label>
-                        <select id="bizyair-template" class="bizyair-input" onchange="window.switchBizyairTemplate(this.value)">
-                            ${templateOptions}
-                        </select>
-                        
-                        <label class="bizyair-compact-label">Web App ID</label>
-                        <input type="text" id="bizyair-web-app-id" class="bizyair-input" value="${bizyairWebAppId}" placeholder="默认: ${getTemplateDef(bizyairTemplate).defaultWebAppId}">
+                        <div class="bizyair-field">
+                            <label class="bizyair-compact-label">API Key</label>
+                            <textarea id="bizyair-api-key" class="bizyair-input" rows="2" placeholder="API Key（多个用逗号分隔）" style="margin-bottom:10px;">${escapeHtml(bizyairApiKey)}</textarea>
+                        </div>
+                        <div class="bizyair-field">
+                            <label class="bizyair-compact-label">生图模板</label>
+                            <select id="bizyair-template" class="bizyair-input" onchange="window.switchBizyairTemplate(this.value)" style="margin-bottom:10px;">${templateOptions}</select>
+                        </div>
+                        <div class="bizyair-field">
+                            <label class="bizyair-compact-label">Web App ID</label>
+                            <input type="text" id="bizyair-web-app-id" class="bizyair-input" value="${bizyairWebAppId}" placeholder="默认: ${getTemplateDef(bizyairTemplate).defaultWebAppId}" style="margin-bottom:0;">
+                        </div>
                     </div>
-                    
+
                     <div class="bizyair-panel-card">
-                        <label style="display:flex; align-items:center; gap: 10px; cursor: pointer;">
+                        <label class="bizyair-check-row">
                             <input type="checkbox" id="bizyair-auto-gen" ${autoGenEnabled ? 'checked' : ''} onchange="window.toggleAutoGen(this.checked)">
-                            <span style="color:#ddd; font-size:13px;">检测到 image## 时自动生成图片</span>
+                            <span>检测到 image## 时自动生图</span>
                         </label>
-                        <label style="display:flex; align-items:center; gap: 10px; cursor: pointer; margin-top:8px;">
+                        <label class="bizyair-check-row">
                             <input type="checkbox" id="bizyair-auto-tag-after-message" ${autoTagAfterMessageEnabled ? 'checked' : ''} onchange="window.toggleAutoTagAfterMessage(this.checked)">
-                            <span style="color:#ddd; font-size:13px;">正文生成后自动触发独立 API 生图</span>
+                            <span>正文生成后自动触发独立 API</span>
                         </label>
-                        <label style="display:flex; align-items:center; gap: 10px; cursor: pointer; margin-top:8px;">
+                        <label class="bizyair-check-row">
                             <input type="checkbox" id="bizyair-queue-limit" ${queueLimitEnabled ? 'checked' : ''} onchange="window.toggleQueueLimit(this.checked)">
-                            <span style="color:#ddd; font-size:13px;">后台排队模式（最多同时发送 2 个请求）</span>
+                            <span>后台排队模式（最多同时 2 个）</span>
                         </label>
-                        <div style="margin-top:6px;color:#888;font-size:12px;line-height:1.4;">适合免费账号：当前生成 1 张，队列里再占 1 张，后面的本地等待。</div>
-                    </div>
-                    
-                    <h3 style="color:#a855f7;margin:15px 0 10px;font-size:14px;">🎨 生图参数</h3>
-                    
-                    <div class="bizyair-two-col">
-                        <div>
-                            <label style="color:#aaa;font-size:11px;">宽度</label>
-                            <input type="number" id="bizyair-width" class="bizyair-input" value="${imageParams.width}" style="margin-bottom:0;">
-                        </div>
-                        <div>
-                            <label style="color:#aaa;font-size:11px;">高度</label>
-                            <input type="number" id="bizyair-height" class="bizyair-input" value="${imageParams.height}" style="margin-bottom:0;">
-                        </div>
-                        <div>
-                            <label style="color:#aaa;font-size:11px;">步数</label>
-                            <input type="number" id="bizyair-steps" class="bizyair-input" value="${imageParams.steps}" style="margin-bottom:0;">
-                        </div>
-                        <div>
-                            <label style="color:#aaa;font-size:11px;">Seed</label>
-                            <input type="number" id="bizyair-seed" class="bizyair-input" value="${imageParams.seed}" style="margin-bottom:0;">
-                        </div>
-                        <div>
-                            <label style="color:#aaa;font-size:11px;">Scale</label>
-                            <input type="number" step="0.1" id="bizyair-scale" class="bizyair-input" value="${imageParams.scaleBy}" style="margin-bottom:0;">
-                        </div>
-                        <div>
-                            <label style="color:#aaa;font-size:11px;">CFG</label>
-                            <input type="number" step="0.1" id="bizyair-cfg" class="bizyair-input" value="${imageParams.cfg}" style="margin-bottom:0;">
-                        </div>
-                    </div>
-                    
-                    <div style="margin-top:10px;">
-                        <label style="color:#aaa;font-size:11px;">Sampler</label>
-                        <select id="bizyair-sampler" class="bizyair-input" style="margin-bottom:0;">
-                            <option value="euler" ${imageParams.sampler === 'euler' ? 'selected' : ''}>euler</option>
-                            <option value="euler_ancestral" ${imageParams.sampler === 'euler_ancestral' ? 'selected' : ''}>euler_ancestral</option>
-                            <option value="dpm_2" ${imageParams.sampler === 'dpm_2' ? 'selected' : ''}>dpm_2</option>
-                            <option value="dpm_2_ancestral" ${imageParams.sampler === 'dpm_2_ancestral' ? 'selected' : ''}>dpm_2_ancestral</option>
-                            <option value="dpmpp_2m" ${imageParams.sampler === 'dpmpp_2m' ? 'selected' : ''}>dpmpp_2m</option>
-                            <option value="uni_pc" ${imageParams.sampler === 'uni_pc' ? 'selected' : ''}>uni_pc</option>
-                        </select>
-                    </div>
-                    
-                    <div style="margin-top:10px;">
-                        <label style="color:#aaa;font-size:11px;">正面提示词</label>
-                        <textarea id="bizyair-pos-prompt" class="bizyair-input" rows="2" style="margin-bottom:0;">${imageParams.positivePrompt || ""}</textarea>
-                    </div>
-                    
-                    <div style="margin-top:10px;">
-                        <label style="color:#aaa;font-size:11px;">负面提示词</label>
-                        <textarea id="bizyair-neg-prompt" class="bizyair-input" rows="2" style="margin-bottom:0;">${imageParams.negativePrompt}</textarea>
-                    </div>
-                    
-                    <div style="margin: 15px 0; padding: 10px; background: #2a2a2a; border-radius: 4px;">
-                        <label style="display:flex; align-items:center; gap: 10px; cursor: pointer;">
-                            <input type="checkbox" id="bizyair-random-seed" ${imageParams.randomSeed ? 'checked' : ''} onchange="window.toggleRandomSeed(this.checked)">
-                            <span style="color:#ddd; font-size:13px;">每次生图随机种子</span>
-                        </label>
-                        <div id="bizyair-seed-hint" style="margin-top:6px;color:#f59e0b;font-size:12px;"></div>
+                        <div class="bizyair-hint">免费账号：生成 1 张 + 队列 1 张，其余本地等待。</div>
                     </div>
 
-                    <div style="margin-top:10px;">
-                        <button type="button" class="bizyair-btn bizyair-btn-secondary" style="width:100%;" onclick="window.toggleBizyairAdvanced()">⚙️ 高级参数</button>
-                    </div>
-                    <div id="bizyair-advanced-panel" style="display:none;margin-top:10px;">
+                    <div class="bizyair-section-title">生图参数</div>
+                    <div class="bizyair-panel-card">
                         <div class="bizyair-two-col">
-                            <div>
-                                <label style="color:#aaa;font-size:11px;">Scheduler</label>
-                                <input type="text" id="bizyair-scheduler" class="bizyair-input" value="${imageParams.scheduler || ''}" style="margin-bottom:0;">
+                            <div class="bizyair-field">
+                                <label class="bizyair-compact-label">宽度</label>
+                                <input type="number" id="bizyair-width" class="bizyair-input" value="${imageParams.width}">
                             </div>
-                            <div>
-                                <label style="color:#aaa;font-size:11px;">Denoise</label>
-                                <input type="number" step="0.01" id="bizyair-denoise" class="bizyair-input" value="${imageParams.denoise !== undefined ? imageParams.denoise : ''}" style="margin-bottom:0;">
+                            <div class="bizyair-field">
+                                <label class="bizyair-compact-label">高度</label>
+                                <input type="number" id="bizyair-height" class="bizyair-input" value="${imageParams.height}">
                             </div>
-                            <div>
-                                <label style="color:#aaa;font-size:11px;">Aspect Ratio</label>
-                                <input type="text" id="bizyair-aspect-ratio" class="bizyair-input" value="${imageParams.aspectRatio || ''}" style="margin-bottom:0;">
+                            <div class="bizyair-field">
+                                <label class="bizyair-compact-label">步数</label>
+                                <input type="number" id="bizyair-steps" class="bizyair-input" value="${imageParams.steps}">
                             </div>
-                            <div>
-                                <label style="color:#aaa;font-size:11px;">Resolution</label>
-                                <input type="text" id="bizyair-resolution" class="bizyair-input" value="${imageParams.resolution || ''}" style="margin-bottom:0;">
+                            <div class="bizyair-field">
+                                <label class="bizyair-compact-label">种子</label>
+                                <input type="number" id="bizyair-seed" class="bizyair-input" value="${imageParams.seed}">
+                            </div>
+                            <div class="bizyair-field">
+                                <label class="bizyair-compact-label">缩放</label>
+                                <input type="number" step="0.1" id="bizyair-scale" class="bizyair-input" value="${imageParams.scaleBy}">
+                            </div>
+                            <div class="bizyair-field">
+                                <label class="bizyair-compact-label">CFG</label>
+                                <input type="number" step="0.1" id="bizyair-cfg" class="bizyair-input" value="${imageParams.cfg}">
+                            </div>
+                        </div>
+
+                        <div class="bizyair-field" style="margin-top:10px;">
+                            <label class="bizyair-compact-label">采样器</label>
+                            <select id="bizyair-sampler" class="bizyair-input">
+                                <option value="euler" ${imageParams.sampler === 'euler' ? 'selected' : ''}>euler</option>
+                                <option value="euler_ancestral" ${imageParams.sampler === 'euler_ancestral' ? 'selected' : ''}>euler_ancestral</option>
+                                <option value="dpm_2" ${imageParams.sampler === 'dpm_2' ? 'selected' : ''}>dpm_2</option>
+                                <option value="dpm_2_ancestral" ${imageParams.sampler === 'dpm_2_ancestral' ? 'selected' : ''}>dpm_2_ancestral</option>
+                                <option value="dpmpp_2m" ${imageParams.sampler === 'dpmpp_2m' ? 'selected' : ''}>dpmpp_2m</option>
+                                <option value="uni_pc" ${imageParams.sampler === 'uni_pc' ? 'selected' : ''}>uni_pc</option>
+                            </select>
+                        </div>
+
+                        <div class="bizyair-field" style="margin-top:6px;">
+                            <label class="bizyair-compact-label">正面提示词</label>
+                            <textarea id="bizyair-pos-prompt" class="bizyair-input" rows="2">${imageParams.positivePrompt || ""}</textarea>
+                        </div>
+                        <div class="bizyair-field">
+                            <label class="bizyair-compact-label">负面提示词</label>
+                            <textarea id="bizyair-neg-prompt" class="bizyair-input" rows="2">${imageParams.negativePrompt}</textarea>
+                        </div>
+
+                        <label class="bizyair-check-row">
+                            <input type="checkbox" id="bizyair-random-seed" ${imageParams.randomSeed ? 'checked' : ''} onchange="window.toggleRandomSeed(this.checked)">
+                            <span>随机种子</span>
+                        </label>
+                        <div id="bizyair-seed-hint" class="bizyair-hint"></div>
+                    </div>
+
+                    <button type="button" class="bizyair-btn bizyair-btn-secondary bizyair-btn-full" onclick="window.toggleBizyairAdvanced()">高级参数</button>
+                    <div id="bizyair-advanced-panel" style="display:none;margin-top:10px;">
+                        <div class="bizyair-panel-card">
+                            <div class="bizyair-two-col">
+                                <div class="bizyair-field">
+                                    <label class="bizyair-compact-label">Scheduler</label>
+                                    <input type="text" id="bizyair-scheduler" class="bizyair-input" value="${imageParams.scheduler || ''}">
+                                </div>
+                                <div class="bizyair-field">
+                                    <label class="bizyair-compact-label">Denoise</label>
+                                    <input type="number" step="0.01" id="bizyair-denoise" class="bizyair-input" value="${imageParams.denoise !== undefined ? imageParams.denoise : ''}">
+                                </div>
+                                <div class="bizyair-field">
+                                    <label class="bizyair-compact-label">宽高比</label>
+                                    <input type="text" id="bizyair-aspect-ratio" class="bizyair-input" value="${imageParams.aspectRatio || ''}">
+                                </div>
+                                <div class="bizyair-field">
+                                    <label class="bizyair-compact-label">分辨率</label>
+                                    <input type="text" id="bizyair-resolution" class="bizyair-input" value="${imageParams.resolution || ''}">
+                                </div>
                             </div>
                         </div>
                     </div>
-                    
-                    <button class="bizyair-btn bizyair-btn-primary" style="width:100%;margin-top:10px;" onclick="window.saveBizyairSettings()">💾 保存设置</button>
-                    <div id="bizyair-save-hint" style="margin-top:6px;color:#777;font-size:12px;"></div>
 
-                    <h3 style="color:#a855f7;margin:20px 0 10px;font-size:14px;">📥 模板导入</h3>
-                    <div style="margin-bottom:10px;padding:10px;background:#2a2a2a;border-radius:4px;">
-                        <label style="display:block; margin-bottom:5px; color:#aaa; font-size:12px;">模板名称</label>
-                        <input type="text" id="bizyair-import-label" class="bizyair-input" placeholder="例如：我的模板">
+                    <button class="bizyair-btn bizyair-btn-primary bizyair-btn-full" style="margin-top:10px;" onclick="window.saveBizyairSettings()">保存设置</button>
+                    <div id="bizyair-save-hint" class="bizyair-hint"></div>
 
-                        <label style="display:block; margin:10px 0 5px; color:#aaa; font-size:12px;">原始 API 文本</label>
-                        <textarea id="bizyair-import-raw" class="bizyair-input" rows="6" placeholder="粘贴原样的 API 示例代码"></textarea>
-
-                        <button type="button" class="bizyair-btn bizyair-btn-secondary" style="width:100%;margin-top:10px;" onclick="window.parseBizyairTemplate()">🔎 解析模板</button>
-                        <button type="button" id="bizyair-import-confirm" class="bizyair-btn bizyair-btn-primary" style="width:100%;margin-top:10px;" onclick="window.confirmBizyairImport()" disabled>✅ 确认导入</button>
-                        <div id="bizyair-import-hint" style="margin-top:8px;color:#777;font-size:12px;">支持粘贴多个示例，解析后可选择正负面字段。</div>
+                    <div class="bizyair-section-title">模板导入</div>
+                    <div class="bizyair-panel-card">
+                        <div class="bizyair-field">
+                            <label class="bizyair-compact-label">模板名称</label>
+                            <input type="text" id="bizyair-import-label" class="bizyair-input" placeholder="例如：我的模板">
+                        </div>
+                        <div class="bizyair-field">
+                            <label class="bizyair-compact-label">原始 API 文本</label>
+                            <textarea id="bizyair-import-raw" class="bizyair-input" rows="5" placeholder="粘贴原样的 API 示例代码"></textarea>
+                        </div>
+                        <button type="button" class="bizyair-btn bizyair-btn-secondary bizyair-btn-full" onclick="window.parseBizyairTemplate()">解析模板</button>
+                        <button type="button" id="bizyair-import-confirm" class="bizyair-btn bizyair-btn-primary bizyair-btn-full" style="margin-top:8px;" onclick="window.confirmBizyairImport()" disabled>确认导入</button>
+                        <div id="bizyair-import-hint" class="bizyair-hint">支持粘贴多个示例进行解析。</div>
                         <div id="bizyair-import-review" style="margin-top:10px;"></div>
                     </div>
 
-                    <h3 style="color:#a855f7;margin:20px 0 10px;font-size:14px;">🗂️ 自定义模板管理</h3>
+                    <div class="bizyair-section-title">自定义模板管理</div>
                     <div id="bizyair-custom-templates"></div>
                     <div class="bizyair-view-end-spacer" aria-hidden="true"></div>
                 </div>
 
+                <!-- ===== Tag Tab ===== -->
                 <div id="bizyair-view-tagger" class="bizyair-view bizyair-view-scroll" style="display:none;">
-                    <div style="margin-bottom:15px;padding:10px;background:#2a2a2a;border-radius:4px;">
-                        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;">
+                    <div class="bizyair-panel-card">
+                        <div class="bizyair-row-inline" style="justify-content:space-between;margin-bottom:10px;">
                             <div>
-                                <div style="color:#ddd;font-weight:bold;">独立 API 配置</div>
-                                <div style="font-size:12px;color:#777;">迁移自 bridge 的提示词与解析链路</div>
+                                <div class="bizyair-panel-card-title" style="margin-bottom:2px;">独立 API 配置</div>
+                                <div class="bizyair-panel-card-subtitle">通过独立 LLM 生成 Tag</div>
                             </div>
-                            <label style="display:flex;align-items:center;gap:8px;color:#ddd;font-size:13px;cursor:pointer;">
+                            <label class="bizyair-check-row" style="padding:0;">
                                 <input type="checkbox" id="bizyair-auto-tag" ${autoTagEnabled ? "checked" : ""}>
                                 <span>解析后自动生图</span>
                             </label>
                         </div>
 
-                        <label style="display:block; margin-bottom:5px; color:#aaa; font-size:12px;">LLM URL</label>
-                        <input type="text" id="bizyair-llm-url" class="bizyair-input" value="${escapeHtml(llmSettings.url)}" placeholder="https://api.openai.com/v1">
-
-                        <label style="display:block; margin-bottom:5px; color:#aaa; font-size:12px;">LLM API Key</label>
-                        <input type="password" id="bizyair-llm-key" class="bizyair-input" value="${escapeHtml(llmSettings.key)}" placeholder="输入你的独立 API Key">
-
-                        <label style="display:block; margin-bottom:5px; color:#aaa; font-size:12px;">Model</label>
-                        <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
-                            <div id="bizyair-llm-model-container" style="flex:1;">
-                                <input type="text" id="bizyair-llm-model" class="bizyair-input" value="${escapeHtml(llmSettings.model)}" placeholder="gpt-4o-mini" style="margin-bottom:0;">
-                            </div>
-                            <button class="bizyair-btn bizyair-btn-secondary" style="margin:0;padding:8px 12px;font-size:12px;white-space:nowrap;flex:0 0 auto;width:auto;" onclick="window.fetchBizyairLlmModels()">拉取模型</button>
+                        <div class="bizyair-field">
+                            <label class="bizyair-compact-label">LLM URL</label>
+                            <input type="text" id="bizyair-llm-url" class="bizyair-input" value="${escapeHtml(llmSettings.url)}" placeholder="https://api.openai.com/v1">
                         </div>
-                        <div id="bizyair-llm-model-status" data-preserve="false" style="margin:0 0 10px;color:#777;font-size:12px;line-height:1.5;"></div>
+                        <div class="bizyair-field">
+                            <label class="bizyair-compact-label">LLM API Key</label>
+                            <input type="password" id="bizyair-llm-key" class="bizyair-input" value="${escapeHtml(llmSettings.key)}" placeholder="输入独立 API Key">
+                        </div>
+                        <div class="bizyair-field">
+                            <label class="bizyair-compact-label">模型</label>
+                            <div class="bizyair-row-inline" style="gap:8px;">
+                                <div id="bizyair-llm-model-container" style="flex:1;min-width:0;">
+                                    <input type="text" id="bizyair-llm-model" class="bizyair-input" value="${escapeHtml(llmSettings.model)}" placeholder="gpt-4o-mini" style="margin-bottom:0;">
+                                </div>
+                                <button class="bizyair-btn bizyair-btn-secondary bizyair-btn-sm" style="flex-shrink:0;" onclick="window.fetchBizyairLlmModels()">拉取模型</button>
+                            </div>
+                        </div>
+                        <div id="bizyair-llm-model-status" data-preserve="false" class="bizyair-hint"></div>
 
-                        <label style="display:block; margin-bottom:5px; color:#aaa; font-size:12px;">组合后 System Prompt 预览</label>
-                        <textarea id="bizyair-llm-system-preview" class="bizyair-input" rows="5" readonly style="color:#aaa;"></textarea>
+                        <div class="bizyair-field" style="margin-top:8px;">
+                            <label class="bizyair-compact-label">System Prompt 预览</label>
+                            <textarea id="bizyair-llm-system-preview" class="bizyair-input" rows="4" readonly style="opacity:0.7;"></textarea>
+                        </div>
 
-                        <button class="bizyair-btn bizyair-btn-primary" style="width:100%;" onclick="window.saveBizyairLlmSettings()">💾 保存独立 API 设置</button>
+                        <button class="bizyair-btn bizyair-btn-primary bizyair-btn-full" onclick="window.saveBizyairLlmSettings()">保存独立 API 配置</button>
                     </div>
 
-                    <div style="margin-bottom:15px;padding:10px;background:#2a2a2a;border-radius:4px;">
-                        <div style="color:#ddd;font-weight:bold;margin-bottom:10px;">系统预设</div>
-                        <div style="margin-bottom:12px;padding:10px;background:#222;border:1px solid #333;border-radius:6px;">
-                            <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px;">
+                    <div class="bizyair-panel-card">
+                        <div class="bizyair-panel-card-title">系统预设</div>
+
+                        <div class="bizyair-panel-card" style="background:var(--bz-bg-input);margin-bottom:12px;">
+                            <div class="bizyair-row-inline" style="justify-content:space-between;margin-bottom:8px;">
                                 <div>
-                                    <div style="color:#ddd;font-size:13px;">Bridge 备份导入</div>
-                                    <div style="font-size:12px;color:#777;">支持导入 ComfyBridge_Backup_*.json 中的 presets</div>
+                                    <div style="color:var(--bz-text);font-size:12px;">Bridge 备份导入</div>
+                                    <div class="bizyair-hint">ComfyBridge_Backup_*.json</div>
                                 </div>
                                 <input type="file" id="bizyair-bridge-backup-file" accept=".json,application/json" style="display:none;" onchange="window.importBizyairBridgeBackup(this)">
-                                <label for="bizyair-bridge-backup-file" class="bizyair-btn bizyair-btn-primary" style="margin:0;">一键导入</label>
+                                <label for="bizyair-bridge-backup-file" class="bizyair-btn bizyair-btn-primary bizyair-btn-sm" style="cursor:pointer;">一键导入</label>
                             </div>
                         </div>
-                        <div style="display:grid;grid-template-columns:1fr;gap:15px;">
+
+                        <div class="bizyair-stack" style="gap:16px;">
                             <div>
-                                <div style="color:#f87171;font-size:13px;margin-bottom:6px;">🔓 Jailbreak</div>
+                                <div style="color:#f87171;font-size:12px;font-weight:600;margin-bottom:6px;">Jailbreak</div>
                                 <input type="text" id="bizyair-inp-jailbreak-name" class="bizyair-input" placeholder="预设名称">
-                                <textarea id="bizyair-inp-jailbreak-content" class="bizyair-input" rows="4" placeholder="输入 jailbreak 内容"></textarea>
-                                <div class="bizyair-actions" style="margin-bottom:8px;">
-                                    <button class="bizyair-btn bizyair-btn-secondary" onclick="window.newBizyairPromptPreset('jailbreak')">新建空白</button>
-                                    <button class="bizyair-btn bizyair-btn-primary" onclick="window.saveBizyairPromptPreset('jailbreak')">保存修改</button>
-                                    <button class="bizyair-btn" style="background:#7c3aed;color:white;" onclick="window.saveBizyairPromptPresetAsNew('jailbreak')">另存为</button>
+                                <textarea id="bizyair-inp-jailbreak-content" class="bizyair-input" rows="3" placeholder="输入 Jailbreak 内容"></textarea>
+                                <div class="bizyair-actions" style="margin-bottom:6px;">
+                                    <button class="bizyair-btn bizyair-btn-secondary bizyair-btn-sm" onclick="window.newBizyairPromptPreset('jailbreak')">新建</button>
+                                    <button class="bizyair-btn bizyair-btn-primary bizyair-btn-sm" onclick="window.saveBizyairPromptPreset('jailbreak')">保存</button>
+                                    <button class="bizyair-btn bizyair-btn-sm" style="background:#7c3aed;color:white;" onclick="window.saveBizyairPromptPresetAsNew('jailbreak')">另存为</button>
                                 </div>
-                                <div class="bizyair-actions" style="margin-bottom:8px;">
+                                <div class="bizyair-actions" style="margin-bottom:6px;">
                                     <input type="file" id="bizyair-import-jailbreak-file" accept=".json,application/json" style="display:none;" onchange="window.importBizyairPromptPreset('jailbreak', this)">
-                                    <label for="bizyair-import-jailbreak-file" class="bizyair-btn" style="margin-right:0;background:#444;color:#ddd;">导入</label>
-                                    <button class="bizyair-btn" style="background:#0f766e;color:white;" onclick="window.exportBizyairPromptPreset('jailbreak')">导出</button>
+                                    <label for="bizyair-import-jailbreak-file" class="bizyair-btn bizyair-btn-secondary bizyair-btn-sm" style="cursor:pointer;">导入</label>
+                                    <button class="bizyair-btn bizyair-btn-sm bizyair-btn-success" onclick="window.exportBizyairPromptPreset('jailbreak')">导出</button>
                                 </div>
-                                <div id="bizyair-preset-status-jailbreak" style="font-size:12px;color:#777;margin-bottom:8px;">当前为新建模式</div>
+                                <div id="bizyair-preset-status-jailbreak" class="bizyair-hint">当前为新建模式</div>
                                 <div id="bizyair-list-jailbreak"></div>
                             </div>
+
                             <div>
-                                <div style="color:#38bdf8;font-size:13px;margin-bottom:6px;">📋 Task</div>
+                                <div style="color:#38bdf8;font-size:12px;font-weight:600;margin-bottom:6px;">Task</div>
                                 <input type="text" id="bizyair-inp-task-name" class="bizyair-input" placeholder="预设名称">
-                                <textarea id="bizyair-inp-task-content" class="bizyair-input" rows="4" placeholder="输入 task 内容"></textarea>
-                                <div class="bizyair-actions" style="margin-bottom:8px;">
-                                    <button class="bizyair-btn bizyair-btn-secondary" onclick="window.newBizyairPromptPreset('task')">新建空白</button>
-                                    <button class="bizyair-btn bizyair-btn-primary" onclick="window.saveBizyairPromptPreset('task')">保存修改</button>
-                                    <button class="bizyair-btn" style="background:#7c3aed;color:white;" onclick="window.saveBizyairPromptPresetAsNew('task')">另存为</button>
+                                <textarea id="bizyair-inp-task-content" class="bizyair-input" rows="3" placeholder="输入 Task 内容"></textarea>
+                                <div class="bizyair-actions" style="margin-bottom:6px;">
+                                    <button class="bizyair-btn bizyair-btn-secondary bizyair-btn-sm" onclick="window.newBizyairPromptPreset('task')">新建</button>
+                                    <button class="bizyair-btn bizyair-btn-primary bizyair-btn-sm" onclick="window.saveBizyairPromptPreset('task')">保存</button>
+                                    <button class="bizyair-btn bizyair-btn-sm" style="background:#7c3aed;color:white;" onclick="window.saveBizyairPromptPresetAsNew('task')">另存为</button>
                                 </div>
-                                <div class="bizyair-actions" style="margin-bottom:8px;">
+                                <div class="bizyair-actions" style="margin-bottom:6px;">
                                     <input type="file" id="bizyair-import-task-file" accept=".json,application/json" style="display:none;" onchange="window.importBizyairPromptPreset('task', this)">
-                                    <label for="bizyair-import-task-file" class="bizyair-btn" style="margin-right:0;background:#444;color:#ddd;">导入</label>
-                                    <button class="bizyair-btn" style="background:#0f766e;color:white;" onclick="window.exportBizyairPromptPreset('task')">导出</button>
+                                    <label for="bizyair-import-task-file" class="bizyair-btn bizyair-btn-secondary bizyair-btn-sm" style="cursor:pointer;">导入</label>
+                                    <button class="bizyair-btn bizyair-btn-sm bizyair-btn-success" onclick="window.exportBizyairPromptPreset('task')">导出</button>
                                 </div>
-                                <div id="bizyair-preset-status-task" style="font-size:12px;color:#777;margin-bottom:8px;">当前为新建模式</div>
+                                <div id="bizyair-preset-status-task" class="bizyair-hint">当前为新建模式</div>
                                 <div id="bizyair-list-task"></div>
                             </div>
+
                             <div>
-                                <div style="color:#f472b6;font-size:13px;margin-bottom:6px;">👤 Character</div>
+                                <div style="color:#f472b6;font-size:12px;font-weight:600;margin-bottom:6px;">角色</div>
                                 <input type="text" id="bizyair-inp-char-name" class="bizyair-input" placeholder="角色名称">
-                                <textarea id="bizyair-inp-char-content" class="bizyair-input" rows="4" placeholder="输入角色设定"></textarea>
-                                <div class="bizyair-actions" style="margin-bottom:8px;">
-                                    <button class="bizyair-btn bizyair-btn-secondary" onclick="window.newBizyairPromptPreset('char')">新建空白</button>
-                                    <button class="bizyair-btn bizyair-btn-primary" onclick="window.saveBizyairPromptPreset('char')">保存修改</button>
-                                    <button class="bizyair-btn" style="background:#7c3aed;color:white;" onclick="window.saveBizyairPromptPresetAsNew('char')">另存为</button>
+                                <textarea id="bizyair-inp-char-content" class="bizyair-input" rows="3" placeholder="输入角色设定"></textarea>
+                                <div class="bizyair-actions" style="margin-bottom:6px;">
+                                    <button class="bizyair-btn bizyair-btn-secondary bizyair-btn-sm" onclick="window.newBizyairPromptPreset('char')">新建</button>
+                                    <button class="bizyair-btn bizyair-btn-primary bizyair-btn-sm" onclick="window.saveBizyairPromptPreset('char')">保存</button>
+                                    <button class="bizyair-btn bizyair-btn-sm" style="background:#7c3aed;color:white;" onclick="window.saveBizyairPromptPresetAsNew('char')">另存为</button>
                                 </div>
-                                <div class="bizyair-actions" style="margin-bottom:8px;">
+                                <div class="bizyair-actions" style="margin-bottom:6px;">
                                     <input type="file" id="bizyair-import-char-file" accept=".json,application/json" style="display:none;" onchange="window.importBizyairPromptPreset('char', this)">
-                                    <label for="bizyair-import-char-file" class="bizyair-btn" style="margin-right:0;background:#444;color:#ddd;">导入</label>
-                                    <button class="bizyair-btn" style="background:#0f766e;color:white;" onclick="window.exportBizyairPromptPreset('char')">导出</button>
+                                    <label for="bizyair-import-char-file" class="bizyair-btn bizyair-btn-secondary bizyair-btn-sm" style="cursor:pointer;">导入</label>
+                                    <button class="bizyair-btn bizyair-btn-sm bizyair-btn-success" onclick="window.exportBizyairPromptPreset('char')">导出</button>
                                 </div>
-                                <div id="bizyair-preset-status-char" style="font-size:12px;color:#777;margin-bottom:8px;">当前为新建模式</div>
+                                <div id="bizyair-preset-status-char" class="bizyair-hint">当前为新建模式</div>
                                 <div id="bizyair-list-char"></div>
                             </div>
                         </div>
                     </div>
 
-                    <div style="padding:10px;background:#2a2a2a;border-radius:4px;">
-                        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px;">
+                    <div class="bizyair-panel-card">
+                        <div class="bizyair-row-inline" style="justify-content:space-between;margin-bottom:10px;">
                             <div>
-                                <div style="color:#ddd;font-weight:bold;">Prompt Lab</div>
-                                <div style="font-size:12px;color:#777;">提取最近两条消息或手动输入剧情上下文</div>
+                                <div class="bizyair-panel-card-title" style="margin-bottom:2px;">Prompt Lab</div>
+                                <div class="bizyair-panel-card-subtitle">从最近消息提取上下文</div>
                             </div>
-                            <button class="bizyair-btn bizyair-btn-secondary" onclick="window.captureBizyairContext()">抓取最近两条</button>
+                            <button class="bizyair-btn bizyair-btn-secondary bizyair-btn-sm" onclick="window.captureBizyairContext()">抓取</button>
                         </div>
-                        <textarea id="bizyair-tag-context" class="bizyair-input" rows="5" placeholder="剧情内容...">${escapeHtml(capturedContext)}</textarea>
-                        <button id="bizyair-generate-tags-btn" class="bizyair-btn bizyair-btn-primary" style="width:100%;margin-bottom:10px;" onclick="window.generateBizyairTags()">✨ 分析并生成 Tag</button>
-                        <div id="bizyair-tag-output" style="min-height:120px;">
-                            <div style="text-align:center;color:#666;padding:20px;">暂无结果</div>
+                        <textarea id="bizyair-tag-context" class="bizyair-input" rows="4" placeholder="剧情内容...">${escapeHtml(capturedContext)}</textarea>
+
+                        <div class="bizyair-field" style="margin-bottom:10px;">
+                            <label class="bizyair-compact-label">正文过滤正则（每行一条，匹配到的内容会被移除）</label>
+                            <textarea id="bizyair-context-regex" class="bizyair-input" rows="3" placeholder="例如：\\[.*?\\]&#10;<.*?>&#10;\\(OOC:.*?\\)">${escapeHtml(contextRegexRules)}</textarea>
+                            <button class="bizyair-btn bizyair-btn-secondary bizyair-btn-sm" onclick="window.saveBizyairContextRegex()">保存过滤规则</button>
+                        </div>
+
+                        <button id="bizyair-generate-tags-btn" class="bizyair-btn bizyair-btn-primary bizyair-btn-full" style="margin-bottom:10px;" onclick="window.generateBizyairTags()">分析并生成 Tag</button>
+                        <div id="bizyair-tag-output" style="min-height:60px;">
+                            <div class="bizyair-hint" style="text-align:center;padding:16px;">暂无结果</div>
                         </div>
                     </div>
                     <div class="bizyair-view-end-spacer" aria-hidden="true"></div>
                 </div>
-                
+
+                <!-- ===== 画廊 Tab ===== -->
                 <div id="bizyair-view-gallery" class="bizyair-view bizyair-view-scroll" style="display:none;">
-                    <div style="display:flex;gap:10px;margin-bottom:15px;">
-                        <button class="bizyair-btn bizyair-btn-secondary" style="flex:1;" onclick="window.downloadAllGalleryImages()">📥 全部下载</button>
-                        <button id="bizyair-edit-btn" class="bizyair-btn" style="flex:1;" onclick="window.toggleGalleryEditMode()">✏️ 编辑</button>
-                        <button class="bizyair-btn" style="background:#ef4444;color:white;flex:1;" onclick="window.clearAllGallery()">🗑️ 清空</button>
+                    <div class="bizyair-row-inline" style="gap:8px;margin-bottom:14px;">
+                        <button class="bizyair-btn bizyair-btn-secondary" style="flex:1;" onclick="window.downloadAllGalleryImages()">全部下载</button>
+                        <button id="bizyair-edit-btn" class="bizyair-btn bizyair-btn-secondary" style="flex:1;" onclick="window.toggleGalleryEditMode()">编辑</button>
+                        <button class="bizyair-btn bizyair-btn-danger" style="flex:1;" onclick="window.clearAllGallery()">清空</button>
                     </div>
-                    <div id="bizyair-gallery-actions" style="display:none;gap:10px;margin-bottom:15px;padding:10px;background:#2a2a2a;border-radius:4px;">
-                        <span style="color:#aaa;font-size:12px;flex:1;display:flex;align-items:center;">已选 <span id="bizyair-selected-count" style="color:#a855f7;margin:0 4px;">0</span> 张</span>
-                        <button class="bizyair-btn bizyair-btn-primary" style="padding:6px 12px;font-size:12px;" onclick="window.downloadSelectedGallery()">下载选中</button>
-                        <button class="bizyair-btn" style="background:#ef4444;color:white;padding:6px 12px;font-size:12px;" onclick="window.deleteSelectedGallery()">删除选中</button>
-                        <button class="bizyair-btn" style="padding:6px 12px;font-size:12px;" onclick="window.toggleGalleryEditMode()">取消</button>
+                    <div id="bizyair-gallery-actions" class="bizyair-panel-card bizyair-row-inline" style="display:none;margin-bottom:14px;">
+                        <span class="bizyair-hint" style="flex:1;display:flex;align-items:center;">已选 <span id="bizyair-selected-count" style="color:var(--bz-accent);margin:0 4px;">0</span> 张</span>
+                        <button class="bizyair-btn bizyair-btn-primary bizyair-btn-sm" onclick="window.downloadSelectedGallery()">下载</button>
+                        <button class="bizyair-btn bizyair-btn-danger bizyair-btn-sm" onclick="window.deleteSelectedGallery()">删除</button>
+                        <button class="bizyair-btn bizyair-btn-secondary bizyair-btn-sm" onclick="window.toggleGalleryEditMode()">取消</button>
                     </div>
-                    <div id="bizyair-gallery-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px;"></div>
+                    <div id="bizyair-gallery-grid"></div>
                     <div class="bizyair-view-end-spacer" aria-hidden="true"></div>
                 </div>
             </div>
@@ -3108,26 +3462,19 @@
         renderCustomTemplateList();
         updateGalleryCount();
         renderLlmPanelState();
-        
+
         window.switchBizyairTab = function(tab) {
-            document.querySelectorAll('.bizyair-tab').forEach(t => {
-                t.classList.remove('active');
-                t.style.color = '#888';
-                t.style.borderBottom = 'none';
-            });
-            document.querySelector(`.bizyair-tab[data-tab="${tab}"]`).classList.add('active');
-            document.querySelector(`.bizyair-tab[data-tab="${tab}"]`).style.color = '#a855f7';
-            document.querySelector(`.bizyair-tab[data-tab="${tab}"]`).style.borderBottom = '2px solid #a855f7';
-            
+            document.querySelectorAll('.bizyair-tab').forEach(t => t.classList.remove('active'));
+            const activeTab = document.querySelector(`.bizyair-tab[data-tab="${tab}"]`);
+            if (activeTab) activeTab.classList.add('active');
+
             document.getElementById('bizyair-view-settings').style.display = tab === 'settings' ? 'block' : 'none';
             document.getElementById('bizyair-view-tagger').style.display = tab === 'tagger' ? 'block' : 'none';
             document.getElementById('bizyair-view-gallery').style.display = tab === 'gallery' ? 'block' : 'none';
-            
-            if (tab === 'gallery') {
-                renderGallery();
-            }
+
+            if (tab === 'gallery') renderGallery();
         };
-        
+
         document.getElementById("bizyair-view-tagger").style.display = "none";
         document.getElementById("bizyair-view-gallery").style.display = "none";
     }
@@ -3142,6 +3489,13 @@
         autoTagAfterMessageEnabled = checked;
         localStorage.setItem(BIZYAIR_AUTO_TAG_AFTER_MESSAGE_KEY, String(checked));
         showToast(checked ? "✅ 正文后自动触发已开启" : "⏸️ 正文后自动触发已关闭");
+    };
+
+    window.saveBizyairContextRegex = function() {
+        const el = document.getElementById("bizyair-context-regex");
+        contextRegexRules = el ? el.value : "";
+        localStorage.setItem(BIZYAIR_CONTEXT_REGEX_KEY, contextRegexRules);
+        showToast("✅ 过滤规则已保存");
     };
 
     window.toggleQueueLimit = function(checked) {
@@ -3620,7 +3974,7 @@
         updateSeedControls(bizyairTemplate, imageParams);
         saveTemplateParams(bizyairTemplate, imageParams);
         
-        document.getElementById("bizyair-settings-modal").classList.remove("show");
+        document.getElementById("bizyair-settings-modal").close();
         showToast("✅ 设置已保存");
         const saveHint = document.getElementById("bizyair-save-hint");
         if (saveHint) saveHint.textContent = "✅ 设置已保存";
@@ -3641,7 +3995,7 @@
                     btn.innerHTML = `<span style="margin-right:0.5rem;">🖼️</span><span>BizyAir</span>`;
                     btn.onclick = (e) => {
                         e.stopPropagation();
-                        document.getElementById("bizyair-settings-modal").classList.add("show");
+                        document.getElementById("bizyair-settings-modal").showModal();
                     };
                     el.parentElement.insertBefore(btn, el);
                 }
@@ -4911,21 +5265,8 @@
     }
 
     window.bizyairOpenGallery = function(url, slotId) {
-        const gallery = document.createElement("div");
+        const gallery = document.createElement("dialog");
         gallery.id = "bizyair-gallery";
-        gallery.style.cssText = `
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100vw;
-            height: 100vh;
-            background: rgba(0,0,0,0.95);
-            z-index: 1000000;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            cursor: pointer;
-        `;
 
         const versions = slotId ? getSlotVersions(slotId).slice().sort((a, b) => b.timestamp - a.timestamp) : [];
         let currentIndex = 0;
@@ -4980,6 +5321,7 @@
         gallery.appendChild(img);
         gallery.appendChild(badge);
         document.body.appendChild(gallery);
+        gallery.showModal();
     };
 
     window.bizyairRegenerate = function(slotId) {
@@ -5040,22 +5382,23 @@
     function renderGallery() {
         const grid = document.getElementById("bizyair-gallery-grid");
         if (!grid) return;
-        
+
         if (galleryData.length === 0) {
-            grid.innerHTML = '<div style="grid-column:1/-1;text-align:center;color:#666;padding:40px;">暂无图片</div>';
+            grid.innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:40px;" class="bizyair-hint">暂无图片</div>';
             return;
         }
-        
+
         grid.innerHTML = galleryData.map((item, idx) => {
             const displayUrl = item.thumbUrl || item.url;
+            const selected = gallerySelected.has(idx);
             return `
-            <div class="bizyair-gallery-item" style="position:relative;aspect-ratio:1;background:#000;border-radius:8px;overflow:hidden;cursor:pointer;${gallerySelected.has(idx) ? 'border:2px solid #a855f7;' : ''}" onclick="${galleryEditMode ? `window.toggleGallerySelect(${idx})` : `window.openBizyairImage(${idx})`}">
-                <img src="${displayUrl}" loading="lazy" decoding="async" style="width:100%;height:100%;object-fit:cover;${galleryEditMode ? 'opacity:0.5;' : ''}">
-                ${galleryEditMode ? `<div style="position:absolute;top:5px;right:5px;width:24px;height:24px;border-radius:50%;background:${gallerySelected.has(idx) ? '#a855f7' : '#666'};display:flex;align-items:center;justify-content:center;color:white;font-size:14px;">${gallerySelected.has(idx) ? '✓' : ''}</div>` : ''}
+            <div class="bizyair-gallery-item${selected ? ' selected' : ''}" onclick="${galleryEditMode ? `window.toggleGallerySelect(${idx})` : `window.openBizyairImage(${idx})`}">
+                <img src="${displayUrl}" loading="lazy" decoding="async" style="${galleryEditMode ? 'opacity:0.5;' : ''}">
+                ${galleryEditMode ? `<div style="position:absolute;top:5px;right:5px;width:22px;height:22px;border-radius:50%;background:${selected ? 'var(--bz-accent)' : 'var(--bz-bg-hover)'};display:flex;align-items:center;justify-content:center;color:white;font-size:12px;">${selected ? '✓' : ''}</div>` : ''}
                 ${!galleryEditMode ? `
-                <div style="position:absolute;bottom:0;left:0;right:0;background:rgba(0,0,0,0.7);display:flex;justify-content:center;gap:5px;padding:5px;opacity:0;transition:opacity 0.2s;" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0">
-                    <button style="background:#3b82f6;color:white;padding:4px 8px;font-size:11px;border:none;border-radius:4px;cursor:pointer;" onclick="event.stopPropagation();window.downloadBizyairImage(${idx})">下载</button>
-                    <button style="background:#ef4444;color:white;padding:4px 8px;font-size:11px;border:none;border-radius:4px;cursor:pointer;" onclick="event.stopPropagation();window.deleteBizyairImage(${idx})">删除</button>
+                <div style="position:absolute;bottom:0;left:0;right:0;background:rgba(0,0,0,0.75);display:flex;justify-content:center;gap:4px;padding:5px;opacity:0;transition:opacity 0.2s;" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0">
+                    <button class="bizyair-btn bizyair-btn-sm bizyair-btn-primary" style="padding:3px 8px;" onclick="event.stopPropagation();window.downloadBizyairImage(${idx})">下载</button>
+                    <button class="bizyair-btn bizyair-btn-sm bizyair-btn-danger" style="padding:3px 8px;" onclick="event.stopPropagation();window.deleteBizyairImage(${idx})">删除</button>
                 </div>` : ''}
             </div>
         `;
@@ -5078,18 +5421,24 @@
     window.toggleGalleryEditMode = function() {
         galleryEditMode = !galleryEditMode;
         gallerySelected.clear();
-        
+
         const btn = document.getElementById('bizyair-edit-btn');
         if (btn) {
-            btn.innerHTML = galleryEditMode ? '✅ 完成' : '✏️ 编辑';
-            btn.style.background = galleryEditMode ? '#a855f7' : '';
+            btn.textContent = galleryEditMode ? '完成' : '编辑';
+            if (galleryEditMode) {
+                btn.classList.remove('bizyair-btn-secondary');
+                btn.classList.add('bizyair-btn-primary');
+            } else {
+                btn.classList.remove('bizyair-btn-primary');
+                btn.classList.add('bizyair-btn-secondary');
+            }
         }
-        
+
         const actionsDiv = document.getElementById('bizyair-gallery-actions');
         if (actionsDiv) {
             actionsDiv.style.display = galleryEditMode ? 'flex' : 'none';
         }
-        
+
         renderGallery();
     }
     
@@ -5146,7 +5495,7 @@
     window.openBizyairGallery = function() {
         loadGalleryFromDB().then(() => {
             createSettingsModal();
-            document.getElementById("bizyair-settings-modal").classList.add("show");
+            document.getElementById("bizyair-settings-modal").showModal();
             window.switchBizyairTab('gallery');
         });
     }
